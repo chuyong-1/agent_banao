@@ -1,0 +1,299 @@
+"""
+server.py — MCP Server: Resource-Planner-Server  (v2)
+======================================================
+Run locally:
+    python server.py
+
+The UI payload now contains four top-level sections:
+  meta          — extracted project requirements
+  summary       — aggregate stats + recommendation
+  candidates    — ranked eligible employees (with bounty + leave detail)
+  disqualified  — employees excluded (HARD or SOFT), with reasons
+  pipeline_warnings — non-fatal processing errors
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import os
+from datetime import date
+from typing import Any, Dict, List
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from mcp.server.fastmcp import FastMCP
+from graph import app
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("resource-planner-server")
+
+mcp = FastMCP(
+    name="Resource-Planner-Server",
+    instructions=(
+        "AI-powered resource availability planner. "
+        "Accepts a natural-language project description and returns a ranked "
+        "list of best-fit employees with availability, skill match, bounty "
+        "reliability scores, leave overlap details, and disqualification reasons."
+    ),
+)
+
+
+# ── UI payload builder ────────────────────────────────────────────────────────
+
+def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform raw LangGraph final state into a structured UI-ready payload.
+
+    Shape:
+    {
+      "meta":               { project requirements },
+      "summary":            { aggregate stats + recommendation },
+      "candidates":         [ ranked cards with all scoring detail ],
+      "disqualified":       [ excluded employees with reasons ],
+      "pipeline_warnings":  [ non-fatal errors ]
+    }
+    """
+    reqs         = final_state.get("extracted_requirements") or {}
+    candidates   = final_state.get("ranked_candidates")      or []
+    disqualified = final_state.get("disqualified_candidates") or []
+    errors       = final_state.get("errors")                  or []
+
+    today_str = date.today().isoformat()
+
+    # ── Meta ──────────────────────────────────────────────────────────────
+    meta: Dict[str, Any] = {
+        "generated_at": today_str,
+        "project_requirements": {
+            "skills_required": reqs.get("skills_required", []),
+            "start_date":      reqs.get("start_date", ""),
+            "duration_weeks":  reqs.get("duration_weeks", 0),
+            "hours_per_week":  reqs.get("hours_per_week", 0),
+            "total_hours":     reqs.get("duration_weeks", 0) * reqs.get("hours_per_week", 0),
+        },
+    }
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    top_fit        = candidates[0]["fit_score"] if candidates else 0.0
+    top_reliability = max((c["reliability_score"] for c in candidates), default=0.0)
+
+    overalloc_count     = sum(1 for c in candidates if c["overallocation_flag"])
+    with_leave_count    = sum(1 for c in candidates if c["leave_overlap_pct"] > 0)
+    with_bounty_issues  = sum(
+        1 for c in candidates
+        if (c["bounty_summary"].get("overdue", 0) or
+            c["bounty_summary"].get("effectively_overdue", 0))
+    )
+    hard_disq = sum(1 for d in disqualified if d["disqualification_type"] == "HARD")
+    soft_disq = sum(1 for d in disqualified if d["disqualification_type"] == "SOFT")
+
+    if top_fit >= 70:
+        recommendation = "✅ Strong candidates available — proceed with selection."
+    elif top_fit >= 40:
+        recommendation = "⚠️  Limited availability — consider timeline adjustment."
+    else:
+        recommendation = "🚫  No well-matched candidates — escalate to resource manager."
+
+    summary: Dict[str, Any] = {
+        "total_evaluated":            len(candidates) + len(disqualified),
+        "candidates_eligible":        len(candidates),
+        "candidates_disqualified":    len(disqualified),
+        "disqualified_hard":          hard_disq,
+        "disqualified_soft":          soft_disq,
+        "candidates_overallocated":   overalloc_count,
+        "candidates_with_leave":      with_leave_count,
+        "candidates_with_bounty_issues": with_bounty_issues,
+        "top_fit_score":              top_fit,
+        "top_reliability_score":      top_reliability,
+        "recommendation":             recommendation,
+        "scoring_weights": {
+            "availability":  "45%",
+            "skill_match":   "30%",
+            "reliability":   "25%",
+        },
+    }
+
+    # ── Candidate cards ───────────────────────────────────────────────────
+    def _status_badge(c: Dict) -> str:
+        if c["fit_score"] >= 75 and not c["overallocation_flag"] and c["leave_overlap_pct"] == 0:
+            return "IDEAL"
+        if c["fit_score"] >= 60:
+            return "AVAILABLE"
+        if c["overallocation_flag"]:
+            return "AT_RISK"
+        if c["leave_overlap_pct"] > 0:
+            return "LEAVE_OVERLAP"
+        return "PARTIAL_FIT"
+
+    BADGE_ICONS = {
+        "IDEAL": "🟢", "AVAILABLE": "🔵",
+        "AT_RISK": "🔴", "LEAVE_OVERLAP": "🟠", "PARTIAL_FIT": "🟡",
+    }
+
+    candidate_cards: List[Dict[str, Any]] = []
+    for c in candidates:
+        badge = _status_badge(c)
+        bm    = c["bounty_summary"]
+        card: Dict[str, Any] = {
+            # Identity
+            "rank":            c["rank"],
+            "employee_id":     c["employee_id"],
+            "name":            c["name"],
+            "role":            c["role"],
+            "department":      c["department"],
+            "hourly_rate_usd": c["hourly_rate_usd"],
+            "status_badge":    badge,
+            "status_icon":     BADGE_ICONS.get(badge, "⚪"),
+
+            # Three-dimension scores
+            "scores": {
+                "fit_score":           c["fit_score"],
+                "availability_score":  c["availability_score"],
+                "skill_match_score":   c["skill_match_score"],
+                "reliability_score":   c["reliability_score"],
+            },
+
+            # Skill breakdown
+            "skills": {
+                "matched":      c["matched_skills"],
+                "missing":      c["missing_skills"],
+                "coverage_pct": round(
+                    len(c["matched_skills"]) /
+                    max(1, len(c["matched_skills"]) + len(c["missing_skills"])) * 100, 1
+                ),
+            },
+
+            # Availability
+            "availability": {
+                "available_hours_per_week": c["available_hours_per_week"],
+                "projected_free_date":      c["projected_free_date"],
+                "overallocation_flag":      c["overallocation_flag"],
+            },
+
+            # Leave (granular)
+            "leave": {
+                "has_overlap":       c["leave_overlap_pct"] > 0,
+                "overlap_pct":       c["leave_overlap_pct"],
+                "overlap_days":      c["leave_overlap_days"],
+                "severity": (
+                    "NONE"    if c["leave_overlap_pct"] == 0 else
+                    "PARTIAL" if c["leave_overlap_pct"] < 25 else
+                    "NOTABLE"
+                ),
+            },
+
+            # Bounty reliability
+            "bounties": {
+                "total_assigned":     bm.get("total", 0),
+                "completed":          bm.get("completed", 0),
+                "in_progress":        bm.get("in_progress", 0),
+                "not_started":        bm.get("not_started", 0),
+                "overdue":            bm.get("overdue", 0),
+                "effectively_overdue": bm.get("effectively_overdue", 0),
+                "active_drain_h_wk":  bm.get("active_drain_h_wk", 0.0),
+                "reliability_score":  bm.get("reliability_score", 70.0),
+                "overdue_titles":     bm.get("overdue_titles", []),
+                "in_progress_titles": bm.get("in_progress_titles", []),
+            },
+
+            # Human-readable signals
+            "match_reasons": c["match_reasons"],
+            "warnings":      c["warnings"],
+        }
+        candidate_cards.append(card)
+
+    # ── Disqualified section ──────────────────────────────────────────────
+    disq_cards: List[Dict[str, Any]] = []
+    for d in disqualified:
+        disq_cards.append({
+            "employee_id":             d["employee_id"],
+            "name":                    d["name"],
+            "role":                    d["role"],
+            "department":              d["department"],
+            "disqualification_type":   d["disqualification_type"],
+            "disqualification_reason": d["disqualification_reason"],
+            "leave_overlap_pct":       d["leave_overlap_pct"],
+            "leave_overlap_days":      d["leave_overlap_days"],
+            "overallocation_flag":     d["overallocation_flag"],
+            "bounties": {
+                "total":       d["bounty_summary"].get("total", 0),
+                "completed":   d["bounty_summary"].get("completed", 0),
+                "overdue":     d["bounty_summary"].get("overdue", 0),
+                "reliability": d["bounty_summary"].get("reliability", 70.0),
+            },
+        })
+
+    return {
+        "meta":              meta,
+        "summary":           summary,
+        "candidates":        candidate_cards,
+        "disqualified":      disq_cards,
+        "pipeline_warnings": errors,
+    }
+
+
+# ── MCP Tool ──────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def analyze_resource_allocation(project_description: str) -> str:
+    """
+    Analyse a natural-language project description and return a full
+    resource availability report as a JSON string.
+
+    The report covers:
+      • Extracted project requirements (skills, dates, hours)
+      • Ranked eligible candidates scored on availability (45%),
+        skill match (30%), and bounty reliability (25%)
+      • Per-candidate leave overlap analysis with severity
+      • Per-candidate bounty breakdown (completed / in_progress /
+        overdue / effectively_overdue) and active hour drain
+      • Disqualified employees (hard: fully on leave or zero capacity;
+        soft: >50% leave overlap) with explicit reasons
+      • Aggregate summary stats and an AI recommendation
+
+    Args:
+        project_description: Free-form text — Jira ticket, SOW excerpt,
+            Slack message, or any description mentioning required skills,
+            timeline, and weekly commitment.
+
+    Returns:
+        JSON string with keys: meta, summary, candidates, disqualified,
+        pipeline_warnings.
+    """
+    logger.info("Tool invoked — input length: %d chars", len(project_description))
+
+    if not project_description or not project_description.strip():
+        return json.dumps({"error": "project_description must not be empty.", "candidates": []})
+
+    try:
+        initial_state = {
+            "raw_project_input":       project_description.strip(),
+            "extracted_requirements":  None,
+            "raw_erp_data":            None,
+            "processed_metrics":       None,
+            "ranked_candidates":       None,
+            "disqualified_candidates": None,
+            "errors":                  [],
+        }
+        final_state = app.invoke(initial_state)
+        payload     = _build_ui_payload(final_state)
+        logger.info(
+            "Pipeline complete — ranked: %d  disqualified: %d",
+            len(payload["candidates"]),
+            len(payload["disqualified"]),
+        )
+        return json.dumps(payload, indent=2, default=str)
+
+    except Exception as exc:
+        logger.exception("Pipeline failed")
+        return json.dumps({"error": str(exc), "type": type(exc).__name__, "candidates": []}, indent=2)
+
+
+if __name__ == "__main__":
+    logger.info("Starting Resource-Planner-Server (stdio transport)...")
+    mcp.run(transport="stdio")

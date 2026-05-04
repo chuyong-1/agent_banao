@@ -1,0 +1,65 @@
+System Architecture Overview
+The Resource Availability Planner is an AI-powered Model Context Protocol (MCP) server. It uses a directed acyclic graph (via LangGraph) to process natural language project descriptions, query HR/ERP data, compute complex availability metrics, and return a strictly ranked list of best-fit employees.
+
+1. Core File Structure
+graph.py: The blueprint of the application. It wires together the four primary operational nodes into a compiled StateGraph.
+
+nodes.py: The brain of the operation. Contains the business logic, heuristic fallbacks, and mathematical calculations for each step of the pipeline.
+
+state.py: The data contract layer. Uses Pydantic to strictly type the inputs, outputs, and intermediate states (like ExtractedRequirements, BountyMetrics, and RankedCandidate).
+
+server.py: The external interface. Wraps the LangGraph pipeline in an MCP server and transforms the raw graph state into a rich, UI-ready JSON payload.
+
+mock_data.py: The simulated database containing realistic employee profiles, assignments, leave records, and bounties (including edge cases).
+
+test_pipeline.py: The regression and unit testing suite, containing 15 targeted assertions to ensure all logic and bug fixes remain intact.
+
+2. The LangGraph Pipeline (Linear Flow)
+The system executes in four distinct, sequential stages:
+
+Node 1: extract_intent
+Purpose: Translates a messy, human-written project description into structured data.
+
+Mechanism: Attempts to use an LLM (GPT-4o-mini) to extract required skills, start dates, duration, and weekly hours.
+
+Resilience: If the LLM fails or no API key is present, it falls back to a robust Regex/Heuristic engine that can extract uppercase acronyms or standard tech stacks.
+
+Node 2: ingest_erp_data
+Purpose: Fetches the current state of the workforce.
+
+Mechanism: Loads all employees, current active assignments, approved leave records, and assigned task "bounties."
+
+Node 3: compute_metrics
+Purpose: The heavy mathematical lifting. Calculates the true availability of every employee.
+
+Key Calculations:
+
+Effective Load: Combines official project assignments with the estimated "drain" of in-progress bounties.
+
+Leave Overlap: Computes exactly what percentage of the requested project window is blocked by approved leave, merging overlapping leave intervals to prevent double-counting.
+
+Reliability Score: Generates a 0-100 score based on an employee's history of completing tasks on time vs. letting them go overdue.
+
+Node 4: matchmaker
+Purpose: Ranks the eligible candidates and strictly filters out the ineligible ones.
+
+Scoring Weights:
+
+45% Availability: Do they actually have the hours?
+
+30% Skill Match: Do they know the required tech stack?
+
+25% Reliability: Do they deliver on time?
+
+Disqualifications: Hard-disqualifies employees with 0 capacity or 100% leave overlap, and soft-disqualifies those with heavy leave overlap, ensuring managers see why someone was excluded.
+
+3. The Output Payload (server.py)
+When the tool is invoked via the MCP server, it returns a structured JSON object divided into these main sections:
+
+meta: The extracted requirements the system used to make its decisions.
+
+summary: Aggregate statistics (e.g., total evaluated, top scores) and a human-readable AI recommendation (e.g., "✅ Strong candidates available").
+
+candidates: The ranked list of eligible employees, containing all granular scores, status badges, and human-readable "match reasons" and "warnings".
+
+disqualified: The list of employees explicitly removed from the running, along with the specific business logic reason for their removal.
