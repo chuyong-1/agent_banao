@@ -1,65 +1,64 @@
-System Architecture Overview
-The Resource Availability Planner is an AI-powered Model Context Protocol (MCP) server. It uses a directed acyclic graph (via LangGraph) to process natural language project descriptions, query HR/ERP data, compute complex availability metrics, and return a strictly ranked list of best-fit employees.
+# Intelligent Staffing & Resource Planner
 
-1. Core File Structure
-graph.py: The blueprint of the application. It wires together the four primary operational nodes into a compiled StateGraph.
+Traditional staffing systems often rely solely on current availability and baseline skills. This planner goes further by evaluating leave conflicts, historical reliability, active "bounty" workload pressure, and overallocation risks to generate highly accurate candidate recommendations.
 
-nodes.py: The brain of the operation. Contains the business logic, heuristic fallbacks, and mathematical calculations for each step of the pipeline.
+## 🚀 Features
 
-state.py: The data contract layer. Uses Pydantic to strictly type the inputs, outputs, and intermediate states (like ExtractedRequirements, BountyMetrics, and RankedCandidate).
+* **Advanced Availability & Workload Tracking:** Factors in both standard project assignments and side-tasks (bounties).
+* **Dynamic Skill Matching:** Intelligently matches extracted skills with required skills, preventing inflation from duplicate requirements.
+* **Reliability Scoring:** Evaluates delivery history, rewarding consistency and penalizing overdue work.
+* **Leave Conflict Resolution:** Calculates leave overlap percentages to prevent scheduling conflicts.
+* **Smart Heuristic Extraction:** Falls back to regex-based tech extraction if the LLM is unavailable.
 
-server.py: The external interface. Wraps the LangGraph pipeline in an MCP server and transforms the raw graph state into a rich, UI-ready JSON payload.
+## 🧮 Core Evaluation Formulas
 
-mock_data.py: The simulated database containing realistic employee profiles, assignments, leave records, and bounties (including edge cases).
+The system uses a weighted, multi-metric approach to evaluate and rank employees.
 
-test_pipeline.py: The regression and unit testing suite, containing 15 targeted assertions to ensure all logic and bug fixes remain intact.
+### 1. Availability Score
+Determines true working capacity.
+* `Effective Assigned Hours = Assignment Hours + (Total Active Bounty Hours / 2)`
+* `Availability Score = 100 - ((Effective Assigned Hours / Capacity Hours) * 100)`
 
-2. The LangGraph Pipeline (Linear Flow)
-The system executes in four distinct, sequential stages:
+### 2. Skill Match Score
+Measures alignment with project requirements.
+* `Skill Match Score = (Matched Skills / Required Skills) * 100`
 
-Node 1: extract_intent
-Purpose: Translates a messy, human-written project description into structured data.
+### 3. Reliability Score
+Evaluates delivery history.
+* `Base Score = (Completed Tasks / (Completed Tasks + Problematic Tasks)) * 100`
+* `Reliability Score = clamp(Base Score - Penalties + Bonuses, 0, 100)`
+  * *Penalties:* -15 points for overdue bounties, -5 points for effectively overdue.
+  * *Bonuses:* +5 points for strong consistency.
 
-Mechanism: Attempts to use an LLM (GPT-4o-mini) to extract required skills, start dates, duration, and weekly hours.
+### 4. Final Fit Score
+Produces a single normalized ranking score.
+* `Fit Score = 0.45(Availability) + 0.30(Skill Match) + 0.25(Reliability)`
 
-Resilience: If the LLM fails or no API key is present, it falls back to a robust Regex/Heuristic engine that can extract uppercase acronyms or standard tech stacks.
+## 🚦 Candidate Status Logic
 
-Node 2: ingest_erp_data
-Purpose: Fetches the current state of the workforce.
+| Badge | Criteria |
+| :--- | :--- |
+| **`IDEAL`** | High fit score, no leave overlap, not overallocated. |
+| **`AVAILABLE`** | Strong fit score, minor or no conflicts. |
+| **`PARTIAL_FIT`** | Moderate skill match or slight availability limits. |
+| **`LEAVE_OVERLAP`** | Employee has a scheduled leave conflict. |
+| **`AT_RISK`** | Employee is overallocated. |
 
-Mechanism: Loads all employees, current active assignments, approved leave records, and assigned task "bounties."
+## 🛠 Tech Stack
 
-Node 3: compute_metrics
-Purpose: The heavy mathematical lifting. Calculates the true availability of every employee.
+* **Workflow Engine:** LangGraph
+* **LLM Orchestration:** LangChain
+* **API Server:** MCP / FastMCP
+* **Validation:** Pydantic
+* **Language & Testing:** Python, Pytest
 
-Key Calculations:
+## ⚙️ Getting Started
 
-Effective Load: Combines official project assignments with the estimated "drain" of in-progress bounties.
+### Prerequisites
+Make sure you have Python 3.8+ installed.
 
-Leave Overlap: Computes exactly what percentage of the requested project window is blocked by approved leave, merging overlapping leave intervals to prevent double-counting.
-
-Reliability Score: Generates a 0-100 score based on an employee's history of completing tasks on time vs. letting them go overdue.
-
-Node 4: matchmaker
-Purpose: Ranks the eligible candidates and strictly filters out the ineligible ones.
-
-Scoring Weights:
-
-45% Availability: Do they actually have the hours?
-
-30% Skill Match: Do they know the required tech stack?
-
-25% Reliability: Do they deliver on time?
-
-Disqualifications: Hard-disqualifies employees with 0 capacity or 100% leave overlap, and soft-disqualifies those with heavy leave overlap, ensuring managers see why someone was excluded.
-
-3. The Output Payload (server.py)
-When the tool is invoked via the MCP server, it returns a structured JSON object divided into these main sections:
-
-meta: The extracted requirements the system used to make its decisions.
-
-summary: Aggregate statistics (e.g., total evaluated, top scores) and a human-readable AI recommendation (e.g., "✅ Strong candidates available").
-
-candidates: The ranked list of eligible employees, containing all granular scores, status badges, and human-readable "match reasons" and "warnings".
-
-disqualified: The list of employees explicitly removed from the running, along with the specific business logic reason for their removal.
+### Installation
+```bash
+git clone <repository-url>
+cd <repository-directory>
+pip install -r requirements.txt
