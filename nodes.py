@@ -39,6 +39,47 @@ from mock_data import MOCK_ERP_DATA
 logger = logging.getLogger(__name__)
 
 
+SKILL_ALIASES: Dict[str, str] = {
+    r"\bpython\b": "Python",            r"\bfastapi\b": "FastAPI",
+    r"\bdjango\b": "Django",             r"\breact\b": "React",
+    r"\bnext\.?js\b": "Next.js",         r"\btypescript\b": "TypeScript",
+    r"\bgraphql\b": "GraphQL",           r"\bpostgres(?:ql)?\b": "PostgreSQL",
+    r"\bmysql\b": "MySQL",               r"\bmongo(?:db)?\b": "MongoDB",
+    r"\baws\b": "AWS",                   r"\bazure\b": "Azure",
+    r"\bgcp\b|google cloud": "GCP",      r"\bdocker\b": "Docker",
+    r"\bkubernetes\b|k8s": "Kubernetes", r"\bterraform\b": "Terraform",
+    r"\bkafka\b": "Kafka",               r"\bspark\b": "Apache Spark",
+    r"\bdbt\b": "dbt",                   r"\bairflow\b": "Airflow",
+    r"\bpytorch\b": "PyTorch",           r"\btensorflow\b": "TensorFlow",
+    r"\blangchain\b": "LangChain",
+    r"\bml\b|machine learning": "Machine Learning",
+    r"\bci[/\-]?cd\b": "CI/CD",          r"\bredis\b": "Redis",
+    r"\bprometheus\b": "Prometheus",     r"\bcobol\b": "COBOL",
+    r"\bjava\b": "Java",                 r"\brust\b": "Rust",
+    r"\bgo(?:lang)?\b": "Go",            r"\bnode\.?js\b|\bnodejs\b": "Node.js",
+    r"\bruby\b": "Ruby",                 r"\bscala\b": "Scala",
+    r"\belixir\b": "Elixir",
+    r"\bmern\b": "MERN Stack",           r"\breact\s+native\b": "React Native",
+    r"\bmanual testing\b": "Manual Testing",
+    r"\bdigital marketing\b": "Digital Marketing",
+    r"\bgraphic design(?:ing)?\b": "Graphic Designing",
+    r"\bbusiness analysis\b": "Business Analysis",
+    r"\bhuman resources\b|\bhr\b": "Human Resources",
+    r"\baccounting\b": "Accounting",
+    r"\bui\s*\/\s*ux\b|\bui\s+ux\b": "UI/UX",
+    r"\bnetworking automation\b": "Networking Automation",
+}
+
+COMMON_TITLE_WORDS = {
+    "We", "The", "Our", "This", "That", "Need", "For", "And", "With",
+    "From", "Into", "Using", "Start", "Have", "Been", "Will", "Should",
+    "Must", "Also", "Some", "Get", "Set", "New", "Build", "Run", "Add",
+    "Very", "Good", "Strong", "Ideal", "Lead", "Team", "Work", "Full",
+    "Time", "Week", "Hour", "Day", "Year", "Month", "Project", "Task",
+    "Senior", "Junior", "Mid", "Level", "Engineer", "Developer", "Analyst",
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -57,6 +98,145 @@ def _date_range_days(start: date, end: date) -> int:
     return max(1, (end - start).days + 1)
 
 
+def _dedupe_case_insensitive(items: List[str]) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+    for item in items:
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
+
+
+def _extract_skills_from_text(text: str, fallback_unspecified: bool = True) -> List[str]:
+    lowered = text.lower()
+    skills = [canon for pat, canon in SKILL_ALIASES.items() if re.search(pat, lowered)]
+    skills = _dedupe_case_insensitive(skills)
+
+    if not skills:
+        all_caps   = re.findall(r"\b[A-Z]{2,}\b", text)
+        title_case = re.findall(r"\b[A-Z][a-z]{2,}(?:\.[a-zA-Z]+)?\b", text)
+        candidates = [t for t in all_caps + title_case if t not in COMMON_TITLE_WORDS]
+        skills = _dedupe_case_insensitive(candidates)
+
+    if not skills and fallback_unspecified:
+        skills = ["Unspecified Technical Skill"]
+
+    return skills
+
+
+def _is_noise_line(line: str) -> bool:
+    lowered = line.lower().strip()
+    if not lowered:
+        return True
+    if "private conversation" in lowered:
+        return True
+    if re.search(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", lowered):
+        return True
+    if "yesterday" in lowered and "at" in lowered:
+        return True
+    if lowered.strip("[]") == "":
+        return True
+    return False
+
+
+def _strip_bullet(line: str) -> str:
+    return re.sub(r"^[\s\-\*]+", "", line).strip()
+
+
+def _extract_headcount(line: str) -> Tuple[int, str]:
+    patterns = [
+        r"(?<!\w)(\d+)\s*(?:people|persons|headcount|hc|resources|staff|members|devs|developers|engineers|testers|designers|analysts)\b",
+        r"(?<!\w)(\d+)\s*x\b",
+        r"\bx\s*(\d+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, line.lower())
+        if m:
+            count = max(1, int(m.group(1)))
+            cleaned = (line[:m.start()] + line[m.end():]).strip()
+            return count, cleaned
+    return 1, line
+
+
+def _clean_department_name(text: str) -> str:
+    cleaned = re.sub(r"\b(people|persons|headcount|hc|resources|staff|members|required|needed)\b", "", text, flags=re.I)
+    cleaned = re.sub(r"[\-:|]+", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _parse_department_requirements(text: str) -> Tuple[List[Dict[str, Any]], str]:
+    raw_lines = text.splitlines()
+    if not raw_lines:
+        return [], text
+
+    lines = [ln.strip() for ln in raw_lines if ln.strip()]
+    if not lines:
+        return [], text
+
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if re.search(r"\bdepartment(?:\s|-)?wise\b|\bdept(?:\s|-)?wise\b", ln.lower()):
+            header_idx = i
+            break
+
+    candidate_lines = lines[header_idx + 1:] if header_idx is not None else lines
+    candidate_lines = [ln for ln in candidate_lines if not _is_noise_line(ln)]
+
+    if len(candidate_lines) == 1 and re.search(r"[,|]", candidate_lines[0]):
+        line_low = candidate_lines[0].lower()
+        if re.search(r"\bdepartment\b|\bdept\b|\bteam\b|\bheadcount\b", line_low):
+            line = candidate_lines[0]
+            if ":" in line and re.search(r"\bdepartment\b|\bdept\b", line.split(":", 1)[0].lower()):
+                line = line.split(":", 1)[1]
+            candidate_lines = [seg.strip() for seg in re.split(r"[,|]", line) if seg.strip()]
+
+    if header_idx is None:
+        if len(candidate_lines) < 3:
+            return [], text
+        shortish = sum(1 for ln in candidate_lines if len(ln) <= 40)
+        if shortish < len(candidate_lines):
+            return [], text
+
+    if not candidate_lines:
+        return [], text
+
+    dept_map: Dict[str, Dict[str, Any]] = {}
+    for raw in candidate_lines:
+        line = _strip_bullet(raw)
+        if not line or _is_noise_line(line):
+            continue
+        people_required, line_wo_count = _extract_headcount(line)
+        dept_name = _clean_department_name(line_wo_count)
+        if not dept_name:
+            continue
+        skills = _extract_skills_from_text(line, fallback_unspecified=False)
+
+        key = dept_name.lower()
+        if key in dept_map:
+            dept_map[key]["people_required"] += people_required
+            dept_map[key]["skills_required"] = _dedupe_case_insensitive(
+                dept_map[key]["skills_required"] + skills
+            )
+        else:
+            dept_map[key] = {
+                "department": dept_name,
+                "skills_required": _dedupe_case_insensitive(skills),
+                "people_required": people_required,
+            }
+
+    remainder_lines = lines[:header_idx] if header_idx is not None else []
+    remainder_text = "\n".join(remainder_lines).strip()
+
+    return list(dept_map.values()), remainder_text
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # NODE 1 — extract_intent_node
 # ═══════════════════════════════════════════════════════════════════════════
@@ -70,6 +250,11 @@ def _llm_extract(text: str) -> ExtractedRequirements:
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a project intake analyst. Extract resourcing requirements. "
+         "If the input includes department-wise allocations, populate "
+         "department_requirements with department name, skills_required, "
+         "and people_required. "
+         "If the input says only those departments should be used, set "
+         "department_only = true. "
          "If start_date is missing default to 2 weeks from today ({today}). "
          "If duration is missing default to 8 weeks. "
          "If hours_per_week is missing default to 20."),
@@ -91,51 +276,27 @@ def _heuristic_extract(text: str) -> ExtractedRequirements:
     """
     lowered = text.lower()
 
-    SKILL_ALIASES: Dict[str, str] = {
-        r"\bpython\b": "Python",            r"\bfastapi\b": "FastAPI",
-        r"\bdjango\b": "Django",             r"\breact\b": "React",
-        r"\bnext\.?js\b": "Next.js",         r"\btypescript\b": "TypeScript",
-        r"\bgraphql\b": "GraphQL",           r"\bpostgres(?:ql)?\b": "PostgreSQL",
-        r"\bmysql\b": "MySQL",               r"\bmongo(?:db)?\b": "MongoDB",
-        r"\baws\b": "AWS",                   r"\bazure\b": "Azure",
-        r"\bgcp\b|google cloud": "GCP",      r"\bdocker\b": "Docker",
-        r"\bkubernetes\b|k8s": "Kubernetes", r"\bterraform\b": "Terraform",
-        r"\bkafka\b": "Kafka",               r"\bspark\b": "Apache Spark",
-        r"\bdbt\b": "dbt",                   r"\bairflow\b": "Airflow",
-        r"\bpytorch\b": "PyTorch",           r"\btensorflow\b": "TensorFlow",
-        r"\blangchain\b": "LangChain",
-        r"\bml\b|machine learning": "Machine Learning",
-        r"\bci[/\-]?cd\b": "CI/CD",          r"\bredis\b": "Redis",
-        r"\bprometheus\b": "Prometheus",     r"\bcobol\b": "COBOL",
-        r"\bjava\b": "Java",                 r"\brust\b": "Rust",
-        r"\bgo(?:lang)?\b": "Go",            r"\bnode\.?js\b": "Node.js",
-        r"\bruby\b": "Ruby",                 r"\bscala\b": "Scala",
-        r"\belixir\b": "Elixir",
-    }
+    dept_reqs, remainder_text = _parse_department_requirements(text)
+    department_only = bool(
+        re.search(
+            r"\bdepartment\s+only\b|\bonly\s+department\b|\bdepartment[-\s]?only\b"
+            r"|\bsame\s+department\s+only\b|\bstrict\s+department\b",
+            lowered,
+        )
+    )
+    skill_source = remainder_text if dept_reqs else text
+    skills = _extract_skills_from_text(skill_source, fallback_unspecified=True)
 
-    skills: List[str] = [canon for pat, canon in SKILL_ALIASES.items()
-                         if re.search(pat, lowered)]
-
-    # BUG #4 FIX: if no known alias matched, try to harvest plausible tech tokens
-    if not skills:
-        # Look for ALL-CAPS acronyms (≥2 chars) or TitleCase words near tech context
-        all_caps   = re.findall(r'\b[A-Z]{2,}\b', text)
-        title_case = re.findall(r'\b[A-Z][a-z]{2,}(?:\.[a-zA-Z]+)?\b', text)
-        # Filter out generic English words
-        _common = {"We","The","Our","This","That","Need","For","And","With",
-                   "From","Into","Using","Start","Have","Been","Will","Should",
-                   "Must","Also","Some","Get","Set","New","Build","Run","Add",
-                   "Very","Good","Strong","Ideal","Lead","Team","Work","Full",
-                   "Time","Week","Hour","Day","Year","Month","Project","Task",
-                   "Senior","Junior","Mid","Level","Engineer","Developer","Analyst"}
-        candidates = [t for t in all_caps + title_case if t not in _common]
-        # Deduplicate while preserving order
-        seen: set = set()
-        skills = [c for c in candidates if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
-
-    # Final fallback — explicit "no known skill" marker so scoring is honest
-    if not skills:
-        skills = ["Unspecified Technical Skill"]
+    if dept_reqs:
+        dept_skills: List[str] = []
+        for d in dept_reqs:
+            dept_skills.extend(d.get("skills_required", []))
+        dept_skills = _dedupe_case_insensitive(dept_skills)
+        if dept_skills:
+            if skills == ["Unspecified Technical Skill"]:
+                skills = dept_skills
+            else:
+                skills = _dedupe_case_insensitive(skills + dept_skills)
 
     # ── Start date ────────────────────────────────────────────────────────
     start_date: date = _today() + timedelta(weeks=2)
@@ -170,6 +331,8 @@ def _heuristic_extract(text: str) -> ExtractedRequirements:
 
     return ExtractedRequirements(
         skills_required=skills,
+        department_requirements=dept_reqs,
+        department_only=department_only,
         start_date=_iso(start_date),
         duration_weeks=max(1, duration_weeks),
         hours_per_week=min(60.0, max(1.0, hours_per_week)),
@@ -602,6 +765,13 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
 
     skills_required: List[str] = reqs["skills_required"]
     hours_needed: float        = reqs["hours_per_week"]
+    dept_reqs = reqs.get("department_requirements") or []
+    department_only = bool(reqs.get("department_only"))
+    allowed_departments = {
+        (d.get("department") or "").strip().lower()
+        for d in dept_reqs
+        if d.get("department")
+    }
     emp_lookup: Dict[str, Dict] = {e["id"]: e for e in erp["employees"]}
 
     ranked:       List[RankedCandidate]       = []
@@ -610,6 +780,9 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
     for m in metrics:
         eid = m["employee_id"]
         emp = emp_lookup[eid]
+        if department_only and allowed_departments:
+            if emp["department"].strip().lower() not in allowed_departments:
+                continue
         bm  = m["bounty_metrics"]
         ld  = m["leave_detail"]
 
@@ -765,6 +938,76 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
     for i, c in enumerate(ranked):
         c.rank = i + 1
 
+    department_recommendations: List[Dict[str, Any]] = []
+    if dept_reqs:
+        for dr in dept_reqs:
+            dept_name = (dr.get("department") or "").strip()
+            if not dept_name:
+                continue
+            people_required = max(1, int(dr.get("people_required") or 1))
+            dept_skills = _dedupe_case_insensitive(dr.get("skills_required") or [])
+
+            if department_only:
+                pool = [c for c in ranked if c.department.lower() == dept_name.lower()]
+                match_mode = "department_only"
+            else:
+                pool = [c for c in ranked if c.department.lower() == dept_name.lower()]
+                if pool:
+                    match_mode = "department"
+                elif dept_skills:
+                    pool = ranked
+                    match_mode = "skills_fallback"
+                else:
+                    pool = []
+                    match_mode = "none"
+
+            candidates: List[Dict[str, Any]] = []
+            for c in pool:
+                dept_skill_score = c.skill_match_score
+                if dept_skills:
+                    _, _, dept_skill_score = _compute_skill_match(
+                        emp_lookup[c.employee_id]["skills"], dept_skills
+                    )
+                dept_fit_score = round(
+                    W_AVAILABILITY * c.availability_score
+                    + W_SKILL       * dept_skill_score
+                    + W_RELIABILITY * c.reliability_score,
+                    1,
+                )
+                candidates.append({
+                    "employee_id": c.employee_id,
+                    "name": c.name,
+                    "role": c.role,
+                    "department": c.department,
+                    "fit_score": c.fit_score,
+                    "availability_score": c.availability_score,
+                    "skill_match_score": c.skill_match_score,
+                    "reliability_score": c.reliability_score,
+                    "department_skill_match_score": dept_skill_score,
+                    "department_fit_score": dept_fit_score,
+                    "available_hours_per_week": c.available_hours_per_week,
+                    "overallocation_flag": c.overallocation_flag,
+                    "leave_overlap_pct": c.leave_overlap_pct,
+                })
+
+            candidates.sort(
+                key=lambda r: (
+                    r["department_fit_score"],
+                    r["reliability_score"],
+                    r["department_skill_match_score"],
+                ),
+                reverse=True,
+            )
+            department_recommendations.append({
+                "department": dept_name,
+                "people_required": people_required,
+                "people_available": len(candidates),
+                "people_shortage": max(0, people_required - len(candidates)),
+                "skills_required": dept_skills,
+                "match_mode": match_mode,
+                "recommended": candidates[:people_required],
+            })
+
     logger.info(
         "[Node 4] Ranked %d | Disqualified %d | Top: %s (fit=%.1f)",
         len(ranked), len(disqualified),
@@ -774,4 +1017,5 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
     return {
         "ranked_candidates":       [c.model_dump() for c in ranked],
         "disqualified_candidates": [d.model_dump() for d in disqualified],
+        "department_recommendations": department_recommendations,
     }

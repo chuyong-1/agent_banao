@@ -4,12 +4,13 @@ server.py — MCP Server: Resource-Planner-Server  (v2)
 Run locally:
     python server.py
 
-The UI payload now contains four top-level sections:
-  meta          — extracted project requirements
-  summary       — aggregate stats + recommendation
-  candidates    — ranked eligible employees (with bounty + leave detail)
-  disqualified  — employees excluded (HARD or SOFT), with reasons
-  pipeline_warnings — non-fatal processing errors
+The UI payload now contains the following top-level sections:
+    meta          — extracted project requirements
+    summary       — aggregate stats + recommendation
+    candidates    — ranked eligible employees (with bounty + leave detail)
+    disqualified  — employees excluded (HARD or SOFT), with reasons
+    departments   — department-wise recommendations (if provided)
+    pipeline_warnings — non-fatal processing errors
 """
 
 from __future__ import annotations
@@ -56,12 +57,14 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
       "summary":            { aggregate stats + recommendation },
       "candidates":         [ ranked cards with all scoring detail ],
       "disqualified":       [ excluded employees with reasons ],
-      "pipeline_warnings":  [ non-fatal errors ]
+            "pipeline_warnings":  [ non-fatal errors ],
+            "departments":        [ department-wise recommendations ]
     }
     """
     reqs         = final_state.get("extracted_requirements") or {}
     candidates   = final_state.get("ranked_candidates")      or []
     disqualified = final_state.get("disqualified_candidates") or []
+    dept_recs    = final_state.get("department_recommendations") or []
     errors       = final_state.get("errors")                  or []
 
     today_str = date.today().isoformat()
@@ -71,6 +74,8 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "generated_at": today_str,
         "project_requirements": {
             "skills_required": reqs.get("skills_required", []),
+            "department_requirements": reqs.get("department_requirements", []),
+            "department_only": reqs.get("department_only", False),
             "start_date":      reqs.get("start_date", ""),
             "duration_weeks":  reqs.get("duration_weeks", 0),
             "hours_per_week":  reqs.get("hours_per_week", 0),
@@ -105,6 +110,8 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "candidates_disqualified":    len(disqualified),
         "disqualified_hard":          hard_disq,
         "disqualified_soft":          soft_disq,
+        "departments_requested":      len(reqs.get("department_requirements", [])),
+        "departments_with_shortage":  sum(1 for d in dept_recs if d.get("people_shortage", 0) > 0),
         "candidates_overallocated":   overalloc_count,
         "candidates_with_leave":      with_leave_count,
         "candidates_with_bounty_issues": with_bounty_issues,
@@ -233,6 +240,7 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "summary":           summary,
         "candidates":        candidate_cards,
         "disqualified":      disq_cards,
+        "departments":       dept_recs,
         "pipeline_warnings": errors,
     }
 
@@ -254,6 +262,8 @@ def analyze_resource_allocation(project_description: str) -> str:
         overdue / effectively_overdue) and active hour drain
       • Disqualified employees (hard: fully on leave or zero capacity;
         soft: >50% leave overlap) with explicit reasons
+            • Department-wise requirements (skills + headcount) and
+                recommended candidates per department (if provided)
       • Aggregate summary stats and an AI recommendation
 
     Args:
@@ -263,7 +273,7 @@ def analyze_resource_allocation(project_description: str) -> str:
 
     Returns:
         JSON string with keys: meta, summary, candidates, disqualified,
-        pipeline_warnings.
+        departments, pipeline_warnings.
     """
     logger.info("Tool invoked — input length: %d chars", len(project_description))
 

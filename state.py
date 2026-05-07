@@ -14,12 +14,37 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
+class DepartmentRequirement(BaseModel):
+    department: str = Field(
+        description="Department / team / stream name for the allocation."
+    )
+    skills_required: List[str] = Field(
+        default_factory=list,
+        description="Skills expected for the department allocation."
+    )
+    people_required: int = Field(default=1, ge=1)
+
+
+# ---------------------------------------------------------------------------
 # 1. LLM Extraction Contract
 # ---------------------------------------------------------------------------
 
 class ExtractedRequirements(BaseModel):
     skills_required: List[str] = Field(
         description="Flat list of technical/domain skills required by the project."
+    )
+    department_requirements: List[DepartmentRequirement] = Field(
+        default_factory=list,
+        description=(
+            "Department-wise skill allotment and headcount requirements, "
+            "if provided in the input."
+        ),
+    )
+    department_only: bool = Field(
+        default=False,
+        description=(
+            "If true, only employees from the listed departments should be considered."
+        ),
     )
     start_date: str = Field(
         description="ISO-8601 kick-off date. Default 2 weeks from today if missing."
@@ -267,5 +292,6 @@ class GraphState(TypedDict):
     processed_metrics:       Optional[List[Dict[str, Any]]]
     ranked_candidates:       Optional[List[Dict[str, Any]]]
     disqualified_candidates: Optional[List[Dict[str, Any]]]   # ← NEW
+    department_recommendations: Optional[List[Dict[str, Any]]]
 
     errors: Optional[List[str]]

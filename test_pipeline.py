@@ -2,7 +2,7 @@
 test_pipeline.py — Comprehensive Test Suite  (v3)
 ==================================================
 Covers:
-  • 3 realistic project scenarios (regression tests)
+      • 4 realistic project scenarios (regression tests)
   • 15 targeted edge-case assertions — including all 5 bug fixes
 
 Run:
@@ -78,6 +78,25 @@ SCENARIOS = [
     ("Kubernetes Infrastructure Migration",
      "Migrate legacy services to Kubernetes on AWS using Terraform and CI/CD. "
      "DevOps engineer needed 30 hours per week for 6 weeks."),
+      ("Department-Wise Hiring Plan",
+       "We need a multi-team rollout. Department-wise\n"
+       "Department-only staffing required.\n"
+       "Python Django - 2 people\n"
+       "Manual Testing - 3 people\n"
+       "Digital Marketing - 1\n"
+       "NodeJS Web Developers - 2\n"
+       "MERN Stack - 1\n"
+       "React Native - 1\n"
+       "Associate HR - 1\n"
+       "Graphic Designing - 1\n"
+       "Business Analysis - 1\n"
+       "Human Resources - 1\n"
+       "UI / UX Designing - 1\n"
+       "BBD Captain - 1\n"
+       "Bunny Team - 1\n"
+       "Accounting - 1\n"
+       "Networking Automation - 1\n"
+       "Start 2025-06-01 for 6 weeks at 20 hours per week."),
 ]
 
 def print_scenario(label: str, p: Dict) -> None:
@@ -314,6 +333,16 @@ if __name__ == "__main__":
         p = _invoke(desc)
         payloads.append(p)
         print_scenario(label, p)
+
+    dept_reqs = payloads[-1]["meta"]["project_requirements"].get("department_requirements", [])
+    check("DEPT — department requirements extracted",
+          len(dept_reqs) >= 5,
+          f"got {len(dept_reqs)}")
+
+    dept_only = payloads[-1]["meta"]["project_requirements"].get("department_only", False)
+    check("DEPT — department-only flag extracted",
+          dept_only is True,
+          f"got {dept_only}")
 
     # ── Run assertions against the first (ML) scenario payload ─────────────
     print(f"\n{'═'*70}")

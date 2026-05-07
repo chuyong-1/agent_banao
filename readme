@@ -6,9 +6,62 @@ Traditional staffing systems often rely solely on current availability and basel
 
 * **Advanced Availability & Workload Tracking:** Factors in both standard project assignments and side-tasks (bounties).
 * **Dynamic Skill Matching:** Intelligently matches extracted skills with required skills, preventing inflation from duplicate requirements.
+* **Department-wise Planning:** Parses department-specific skills and headcount, returning recommendations per department.
+* **Department-only Mode:** Optional strict filtering to only consider listed departments.
 * **Reliability Scoring:** Evaluates delivery history, rewarding consistency and penalizing overdue work.
 * **Leave Conflict Resolution:** Calculates leave overlap percentages to prevent scheduling conflicts.
 * **Smart Heuristic Extraction:** Falls back to regex-based tech extraction if the LLM is unavailable.
+
+## How It Works
+
+1. **Extract requirements** from the input (skills, dates, hours, and optional department-wise headcount).
+2. **Load ERP data** (employees, assignments, leave, and bounties).
+3. **Compute per-employee metrics** (availability, leave overlap, bounty reliability, and overallocation flags).
+4. **Rank candidates** using a weighted fit score and separate hard/soft disqualifications.
+5. **Produce department recommendations** when department-wise requirements are provided, and optionally enforce department-only filtering.
+
+## What It Accounts For
+
+* **All current work**: active project assignments plus in-progress bounty workload.
+* **Leave conflicts**: merged leave windows to avoid double-counting overlap days.
+* **Delivery reliability**: overdue and effectively overdue bounties reduce the score.
+* **Overallocation risk**: employees above 100% utilization are flagged or disqualified.
+* **Department needs**: optional department headcount and skill mapping.
+
+## Department-wise Input Examples
+
+Basic list with headcount:
+```
+Department-wise
+Python Django - 2 people
+Manual Testing - 3 people
+Digital Marketing - 1
+```
+
+Department list with skills inline:
+```
+Department-wise
+Department-only staffing required
+MERN Stack team - 2
+React Native - 1 person
+UI / UX Designing - 2
+```
+
+Single-line list (comma-separated):
+```
+Department-wise: Accounting - 1, Human Resources - 2, Business Analysis - 1
+```
+
+## Dataset Examples (from mock_data.py)
+
+Employees include department labels used for matching:
+```
+EMP-001  Aisha Patel     - Platform Engineering
+EMP-002  Marcus Chen     - AI/ML
+EMP-003  Sofia Rossi     - Product Engineering
+EMP-004  Jamal Williams  - Infrastructure
+EMP-006  Ravi Nair       - Data Platform
+```
 
 ## 🧮 Core Evaluation Formulas
 
@@ -20,17 +73,23 @@ Determines true working capacity.
 * `Availability Score = 100 - ((Effective Assigned Hours / Capacity Hours) * 100)`
 
 ### 2. Skill Match Score
-Measures alignment with project requirements.
-* `Skill Match Score = (Matched Skills / Required Skills) * 100`
+Measures alignment with project requirements using proficiency.
+* `Skill Match Score = (Sum of best-match proficiencies) / (5 × Required Skills) × 100`
 
 ### 3. Reliability Score
 Evaluates delivery history.
-* `Base Score = (Completed Tasks / (Completed Tasks + Problematic Tasks)) * 100`
+* `Actionable = Completed + Problematic`
+* `Base Score = (Completed / max(1, Actionable)) × 100`
 * `Reliability Score = clamp(Base Score - Penalties + Bonuses, 0, 100)`
-  * *Penalties:* -15 points for overdue bounties, -5 points for effectively overdue.
-  * *Bonuses:* +5 points for strong consistency.
+  * *Penalties:* -15 points per overdue, -5 points per effectively overdue.
+  * *Bonuses:* +5 points for strong consistency (high base with enough history).
+  * *Neutral:* If no actionable tasks exist, reliability defaults to 70.
 
-### 4. Final Fit Score
+### 4. Leave Overlap
+Calculates how much approved leave overlaps the project window.
+* `Overlap % = (Merged Overlap Days / Project Days) × 100`
+
+### 5. Final Fit Score
 Produces a single normalized ranking score.
 * `Fit Score = 0.45(Availability) + 0.30(Skill Match) + 0.25(Reliability)`
 
