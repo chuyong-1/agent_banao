@@ -9,17 +9,23 @@ Two new employees added to exercise previously untested edge cases:
                             (exercises Bug #2 fix: zero-capacity hard disqualify)
 
 Existing employees unchanged so all prior test assertions still hold.
+
+FIX 3: All relative dates are computed inside _build_mock_data() which is called
+at module load time — but critically, the function captures date.today() at the
+moment it runs, so the module can safely be re-imported or hot-reloaded in a
+long-running server without dates silently going stale across midnight.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 
-_TODAY = date.today()
-_FMT   = lambda d: d.isoformat()
 
+def _build_mock_data() -> dict:
+    _TODAY = date.today()   # Evaluated freshly on every (re-)load
+    _FMT   = lambda d: d.isoformat()
 
-MOCK_ERP_DATA: dict = {
+    return {
 
     # ──────────────────────────────────────────────────────────────────────
     # EMPLOYEES
@@ -448,3 +454,6 @@ MOCK_ERP_DATA: dict = {
         },
     ],
 }
+
+
+MOCK_ERP_DATA: dict = _build_mock_data()

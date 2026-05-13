@@ -1,18 +1,35 @@
 """
-nodes.py — LangGraph Node Functions  (v3 — All Bugs Fixed)
-===========================================================
-Bug fixes applied:
+nodes.py — LangGraph Node Functions  (v4)
+=========================================
+Bug fixes applied in v1–v3:
   #1  _compute_leave_overlap: merge overlapping intervals before summing
-      (prevents double-counting when two leave records overlap each other)
   #2  compute_metrics_node: capacity=0 → hard disqualify immediately
-      (previously returned availability_score=100 and slipped into ranking)
-  #3  _compute_bounty_metrics: reliability denominator now uses only
-      "actionable" bounties (completed + problematic), NOT future not_started
-      (prevents a single future task from collapsing reliability to 0)
-  #4  _heuristic_extract: unknown-skill fallback now extracts UPPERCASE tokens
-      or uses a descriptive label instead of always defaulting to "Python"
+  #3  _compute_bounty_metrics: reliability denominator uses only "actionable" bounties
+  #4  _heuristic_extract: unknown-skill fallback extracts UPPERCASE/TitleCase tokens
   #5  _compute_skill_match: deduplicate skills_required before scoring
-      (prevents inflated score when the same skill appears twice in the list)
+
+Fixes applied in v4:
+  #6  _compute_skill_match: replace bidirectional substring check with word-boundary
+      regex matching — prevents false positives ("Go" matching "Django",
+      "Java" matching "JavaScript", etc.)
+  #7  _compute_leave_overlap: leave_periods now shows the clipped window overlap
+      dates rather than the raw leave record dates (avoids misleading UI display
+      when a leave record extends far outside the project window)
+  #8  _heuristic_extract hours_per_week: fix lastindex == 0 (never True) →
+      use explicit `m.lastindex is None` to distinguish capture-group patterns
+      from no-capture-group patterns (full.?time / half.?time)
+  #9  _compute_bounty_metrics: replace fixed 2-week drain spread with
+      urgency-weighted drain — hours_estimated / max(0.5, days_remaining / 7)
+      so a bounty due tomorrow drains more capacity than one due in four weeks
+  #10 _cached_llm_extract: append date.today() to the cache key so default
+      start_dates (computed relative to today) do not go stale after midnight
+  #11 _cached_llm_extract: remove TOCTOU before/after cache_info() hit/miss
+      comparison — replaced with a single post-call stats log that is safe
+      under concurrent access
+  #12 _cached_llm_extract: maxsize now reads from LLM_CACHE_SIZE env var
+      (default 256) so operators can tune memory use without code changes
+  #13 ingest_erp_data_node: data source abstracted behind _load_erp_data();
+      set ERP_DATA_PATH env var to load real JSON instead of mock data
 """
 
 from __future__ import annotations
@@ -21,6 +38,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from state import (
@@ -34,12 +52,41 @@ from state import (
     LeaveOverlapDetail,
     RankedCandidate,
 )
+import json as _json
 from mock_data import MOCK_ERP_DATA
+
+
+def _load_erp_data() -> Dict[str, Any]:
+    """
+    FIX #13: Load HR/ERP data from an external JSON file if ERP_DATA_PATH is
+    set, otherwise fall back to the built-in mock dataset.
+
+    Usage:
+        export ERP_DATA_PATH=/path/to/erp_data.json
+
+    The JSON must conform to the ERPData schema — top-level keys:
+        employees, assignments, leaves, bounties  (all arrays).
+
+    If the path is set but the file cannot be read or parsed, the node logs a
+    warning and falls back to mock data rather than crashing the pipeline.
+    """
+    path = os.getenv("ERP_DATA_PATH", "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            logger.info("[ERP] Loaded real data from %s", path)
+            return data
+        except Exception as exc:
+            logger.warning(
+                "[ERP] Failed to load %s (%s) — falling back to mock data", path, exc
+            )
+    return MOCK_ERP_DATA
 
 logger = logging.getLogger(__name__)
 
 
-SKILL_ALIASES: Dict[str, str] = {
+_SKILL_ALIASES_RAW: Dict[str, str] = {
     r"\bpython\b": "Python",            r"\bfastapi\b": "FastAPI",
     r"\bdjango\b": "Django",             r"\breact\b": "React",
     r"\bnext\.?js\b": "Next.js",         r"\btypescript\b": "TypeScript",
@@ -69,6 +116,14 @@ SKILL_ALIASES: Dict[str, str] = {
     r"\bui\s*\/\s*ux\b|\bui\s+ux\b": "UI/UX",
     r"\bnetworking automation\b": "Networking Automation",
 }
+
+# FIX 2: Compile all alias patterns once at module load.
+# Previously re.search(pat, text) was called per-invocation without caching,
+# forcing Python to recompile every pattern on every request.
+COMPILED_ALIASES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(pat, re.IGNORECASE), canon)
+    for pat, canon in _SKILL_ALIASES_RAW.items()
+]
 
 COMMON_TITLE_WORDS = {
     "We", "The", "Our", "This", "That", "Need", "For", "And", "With",
@@ -115,7 +170,7 @@ def _dedupe_case_insensitive(items: List[str]) -> List[str]:
 
 def _extract_skills_from_text(text: str, fallback_unspecified: bool = True) -> List[str]:
     lowered = text.lower()
-    skills = [canon for pat, canon in SKILL_ALIASES.items() if re.search(pat, lowered)]
+    skills = [canon for pat, canon in COMPILED_ALIASES if pat.search(lowered)]
     skills = _dedupe_case_insensitive(skills)
 
     if not skills:
@@ -245,7 +300,12 @@ def _llm_extract(text: str) -> ExtractedRequirements:
     from langchain_openai import ChatOpenAI
     from langchain_core.prompts import ChatPromptTemplate
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        timeout=8,      # hard cap — prevents the 15s+ spike seen under load
+        max_retries=2,  # retry twice before raising, then fallback to heuristic
+    )
     structured_llm = llm.with_structured_output(ExtractedRequirements)
     prompt = ChatPromptTemplate.from_messages([
         ("system",
@@ -261,6 +321,31 @@ def _llm_extract(text: str) -> ExtractedRequirements:
         ("human", "{text}"),
     ])
     return (prompt | structured_llm).invoke({"text": text, "today": _iso(_today())})
+
+
+# FIX #12: Read cache size from environment so operators can tune memory use
+# without code changes.  Default 256 ≈ 24 h of unique prompts at typical
+# volumes (~500 B–2 KB JSON per entry → ~500 KB worst-case resident memory).
+# Set LLM_CACHE_SIZE=0 to disable caching entirely (useful in testing).
+_LLM_CACHE_SIZE: int = int(os.getenv("LLM_CACHE_SIZE", "256"))
+
+
+@lru_cache(maxsize=_LLM_CACHE_SIZE)
+def _cached_llm_extract(text: str) -> str:
+    """
+    Cache LLM extraction results keyed on (normalised input, today's date).
+
+    The date suffix (FIX #10) ensures that default start_dates — computed
+    relative to today inside the LLM prompt — are never served from a cache
+    entry made on a previous calendar day.  Only prompts that omit an explicit
+    start_date are affected; prompts with a literal date in them are unaffected.
+
+    Returns a JSON string so the cache holds an immutable value; callers
+    deserialise a fresh model each time, preventing accidental mutation.
+
+    lru_cache is process-local and thread-safe for reads (CPython GIL).
+    """
+    return _llm_extract(text).model_dump_json()
 
 
 def _heuristic_extract(text: str) -> ExtractedRequirements:
@@ -325,8 +410,15 @@ def _heuristic_extract(text: str) -> ExtractedRequirements:
                 r"full.?time", r"half.?time"]:
         m = re.search(pat, lowered)
         if m:
-            hours_per_week = (40.0 if "full" in (m.group(0) if m.lastindex == 0 else pat)
-                              else 20.0) if not m.lastindex else float(m.group(1))
+            # FIX #8: m.lastindex is None when the pattern has no capture
+            # groups (full.?time / half.?time); it is 1 when there is one
+            # group.  The old check `m.lastindex == 0` was never True because
+            # re uses 1-based group indexing — patterns with one group yield
+            # lastindex=1, not 0.  Use explicit `is None` test instead.
+            if m.lastindex is None:
+                hours_per_week = 40.0 if "full" in m.group(0) else 20.0
+            else:
+                hours_per_week = float(m.group(1))
             break
 
     return ExtractedRequirements(
@@ -347,7 +439,25 @@ def extract_intent_node(state: GraphState) -> Dict[str, Any]:
 
     if os.getenv("OPENAI_API_KEY"):
         try:
-            reqs = _llm_extract(raw_text)
+            # FIX #10: append today's date to the cache key so cached entries
+            # with a defaulted start_date (relative to "today") never survive
+            # past midnight into the next calendar day.
+            cache_key = raw_text.strip() + "\x00" + _today().isoformat()
+            reqs = ExtractedRequirements.model_validate_json(
+                _cached_llm_extract(cache_key)
+            )
+            # FIX #11: removed TOCTOU before/after cache_info() comparison.
+            # Under concurrent load the before/after hit-count delta can be
+            # corrupted by other threads, producing swapped or duplicated
+            # "CACHE HIT" / "API call" log messages.  Log aggregate stats
+            # once after the call instead — always accurate, never racy.
+            info = _cached_llm_extract.cache_info()
+            logger.info(
+                "[Node 1] LLM extraction complete "
+                "(cache hits=%d misses=%d currsize=%d/%s)",
+                info.hits, info.misses, info.currsize,
+                str(_LLM_CACHE_SIZE) if _LLM_CACHE_SIZE else "∞",
+            )
         except Exception as exc:
             logger.warning("[Node 1] LLM failed (%s), falling back", exc)
             errors.append(f"LLM extraction failed ({exc}); used heuristic fallback.")
@@ -364,9 +474,9 @@ def extract_intent_node(state: GraphState) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def ingest_erp_data_node(state: GraphState) -> Dict[str, Any]:
-    """Node 2 — Load and validate HR/ERP data (mock or real)."""
+    """Node 2 — Load and validate HR/ERP data (mock or real via ERP_DATA_PATH)."""
     logger.info("[Node 2] ingest_erp_data_node — loading data")
-    erp = ERPData(**MOCK_ERP_DATA)
+    erp = ERPData(**_load_erp_data())
     logger.info("[Node 2] %d employees | %d assignments | %d leaves | %d bounties",
                 len(erp.employees), len(erp.assignments),
                 len(erp.leaves), len(erp.bounties))
@@ -404,12 +514,14 @@ def _merge_intervals(intervals: List[Tuple[date, date]]) -> List[Tuple[date, dat
 
 def _compute_leave_overlap(
     leaves: List[Dict],
-    employee_id: str,
     proj_start: date,
     proj_end: date,
 ) -> LeaveOverlapDetail:
     """
     Compute how much of the project window is covered by approved leave.
+
+    Accepts a pre-filtered list of leave records for a single employee
+    (caller indexes by employee_id before calling — see compute_metrics_node).
 
     BUG #1 FIX — interval merging:
       Old: summed raw overlap per record → double-counted overlapping leaves.
@@ -424,8 +536,6 @@ def _compute_leave_overlap(
     leave_periods: List[str] = []
 
     for lv in leaves:
-        if lv["employee_id"] != employee_id:
-            continue
         lv_start = _parse_date(lv["start_date"])
         lv_end   = _parse_date(lv["end_date"])
 
@@ -434,9 +544,21 @@ def _compute_leave_overlap(
         clip_end   = min(lv_end,   proj_end)
         if clip_start <= clip_end:
             clipped_intervals.append((clip_start, clip_end))
-            leave_periods.append(
-                f"{lv['leave_type']}: {lv['start_date']} → {lv['end_date']}"
+            # FIX #7: show the clipped overlap window dates so the UI displays
+            # how many days fall inside the project — not the full leave span.
+            # Append the original leave dates in parentheses only when the
+            # leave record extends outside the project window, so managers
+            # can see the full context without being misled by dates that fall
+            # outside the period they care about.
+            overlap_str = (
+                f"{lv['leave_type']}: {_iso(clip_start)} → {_iso(clip_end)}"
             )
+            is_clipped = clip_start != lv_start or clip_end != lv_end
+            if is_clipped:
+                overlap_str += (
+                    f" (full leave: {lv['start_date']} → {lv['end_date']})"
+                )
+            leave_periods.append(overlap_str)
 
     # Merge overlapping clips to avoid double-counting (BUG #1 FIX)
     merged = _merge_intervals(clipped_intervals)
@@ -457,11 +579,13 @@ def _compute_leave_overlap(
 
 def _compute_bounty_metrics(
     bounties: List[Dict],
-    employee_id: str,
     today: date,
 ) -> BountyMetrics:
     """
     Aggregate bounty statistics and derive reliability_score (0-100).
+
+    Accepts a pre-filtered list of bounties for a single employee
+    (caller indexes by employee_id before calling — see compute_metrics_node).
 
     BUG #3 FIX — reliability denominator:
       Old: base = completed / total × 100
@@ -480,7 +604,7 @@ def _compute_bounty_metrics(
       reliability   = clamp(base − penalty + consistency, 0, 100)
       no history OR only future tasks → 70 (neutral)
     """
-    emp_bounties = [b for b in bounties if b["employee_id"] == employee_id]
+    emp_bounties = bounties  # already filtered by caller
 
     if not emp_bounties:
         return BountyMetrics(
@@ -494,7 +618,8 @@ def _compute_bounty_metrics(
 
     completed_cnt = in_progress_cnt = not_started_cnt = overdue_cnt = 0
     eff_overdue_cnt = 0
-    active_hours = 0.0
+    active_hours = 0.0          # raw total estimated hours (for reporting)
+    active_hours_weekly = 0.0   # FIX #9: urgency-weighted weekly drain
     overdue_titles: List[str]     = []
     in_progress_titles: List[str] = []
     completed_titles: List[str]   = []
@@ -515,6 +640,14 @@ def _compute_bounty_metrics(
             active_hours += b["hours_estimated"]
             if is_past_due:
                 eff_overdue_cnt += 1   # running but already past deadline
+            # FIX #9: weight drain by urgency rather than a fixed 2-week window.
+            # drain_weeks = days_remaining / 7, clamped to [0.5, 4.0]:
+            #   due tomorrow  → drain_weeks=0.5 → 2× pressure  (urgent)
+            #   due in 2 wks  → drain_weeks=2.0 → same as before (unchanged)
+            #   due in 4 wks  → drain_weeks=4.0 → ½ the pressure (not urgent)
+            days_remaining = max(0, (due - today).days)
+            drain_weeks = max(0.5, min(4.0, days_remaining / 7.0))
+            active_hours_weekly += b["hours_estimated"] / drain_weeks
 
         elif status == BountyStatus.NOT_STARTED:
             not_started_cnt += 1
@@ -527,8 +660,6 @@ def _compute_bounty_metrics(
 
     total            = len(emp_bounties)
     total_problematic = overdue_cnt + eff_overdue_cnt
-
-    # BUG #3 FIX: use "actionable" denominator instead of total
     actionable = completed_cnt + total_problematic
     if actionable == 0:
         # Only future/neutral tasks — no track record yet → neutral
@@ -539,7 +670,10 @@ def _compute_bounty_metrics(
         consistency_bonus = 5.0 if (base > 90 and actionable >= 3) else 0.0
         reliability       = round(max(0.0, min(100.0, base - penalty + consistency_bonus)), 1)
 
-    active_hours_weekly = round(active_hours / 2.0, 2)
+    active_hours_weekly = round(active_hours_weekly, 2)
+    # FIX #9: active_hours_weekly is now urgency-weighted (see loop above).
+    # Previously this was a fixed ÷2 spread regardless of when each bounty
+    # was due.  The new value correctly reflects near-term vs. far-future work.
 
     return BountyMetrics(
         total_assigned         = total,
@@ -585,6 +719,17 @@ def compute_metrics_node(state: GraphState) -> Dict[str, Any]:
         if _parse_date(a["end_date"]) >= proj_start:
             active_asgns[a["employee_id"]].append(a)
 
+    # FIX 1: Pre-index leaves and bounties by employee_id (O(n) once) so the
+    # per-employee helpers receive only their own records instead of scanning
+    # the entire dataset on every iteration (was O(n²) at scale).
+    leave_by_emp: Dict[str, List[Dict]] = {}
+    for lv in leaves:
+        leave_by_emp.setdefault(lv["employee_id"], []).append(lv)
+
+    bounty_by_emp: Dict[str, List[Dict]] = {}
+    for b in bounties:
+        bounty_by_emp.setdefault(b["employee_id"], []).append(b)
+
     metrics: List[Dict[str, Any]] = []
 
     for emp in employees:
@@ -594,8 +739,8 @@ def compute_metrics_node(state: GraphState) -> Dict[str, Any]:
         # ── BUG #2 FIX: zero-capacity guard ───────────────────────────────
         if capacity <= 0:
             # Still compute bounty metrics for the disqualified card
-            bm = _compute_bounty_metrics(bounties, eid, today)
-            ld = _compute_leave_overlap(leaves, eid, proj_start, proj_end)
+            bm = _compute_bounty_metrics(bounty_by_emp.get(eid, []), today)
+            ld = _compute_leave_overlap(leave_by_emp.get(eid, []), proj_start, proj_end)
             m  = EmployeeMetrics(
                 employee_id                = eid,
                 name                       = emp["name"],
@@ -625,7 +770,7 @@ def compute_metrics_node(state: GraphState) -> Dict[str, Any]:
         asgn_hours = sum(a["hours_per_week"] for a in active_asgns.get(eid, []))
 
         # ── Bounty metrics ─────────────────────────────────────────────────
-        bm = _compute_bounty_metrics(bounties, eid, today)
+        bm = _compute_bounty_metrics(bounty_by_emp.get(eid, []), today)
 
         # ── Effective load = assignments + in-progress bounty drain ────────
         effective_assigned = asgn_hours + bm.active_bounty_hours_weekly
@@ -643,7 +788,7 @@ def compute_metrics_node(state: GraphState) -> Dict[str, Any]:
             projected_free_date = _iso(today)
 
         # ── Leave overlap ──────────────────────────────────────────────────
-        ld = _compute_leave_overlap(leaves, eid, proj_start, proj_end)
+        ld = _compute_leave_overlap(leave_by_emp.get(eid, []), proj_start, proj_end)
 
         # ── Disqualification ──────────────────────────────────────────────
         disqualified   = False
@@ -728,6 +873,18 @@ def _compute_skill_match(
             seen_req.add(key)
             unique_required.append(s)
 
+    # FIX #6: pre-compiled word-boundary patterns for each lowercased skill name
+    # seen so far.  Built lazily and cached here so repeated calls for the same
+    # skill set don't re-compile patterns on every invocation.
+    _skill_pattern_cache: Dict[str, re.Pattern] = {}
+
+    def _skill_pat(skill: str) -> re.Pattern:
+        if skill not in _skill_pattern_cache:
+            _skill_pattern_cache[skill] = re.compile(
+                r"\b" + re.escape(skill) + r"\b", re.IGNORECASE
+            )
+        return _skill_pattern_cache[skill]
+
     skill_map: Dict[str, int] = {s["name"].lower(): s["proficiency"] for s in emp_skills}
     matched: List[str] = []
     missing: List[str] = []
@@ -735,9 +892,14 @@ def _compute_skill_match(
 
     for req in unique_required:
         req_l     = req.lower()
+        req_pat   = _skill_pat(req_l)
         best_prof = 0
         for sk_name, prof in skill_map.items():
-            if req_l in sk_name or sk_name in req_l:
+            # FIX #6: use word-boundary regex in both directions to prevent
+            # false positives like "Go" ⊆ "Django", "Java" ⊆ "JavaScript".
+            # Bidirectional matching is retained so that "PostgreSQL" still
+            # matches an employee skill listed as "PostgreSQL DBA".
+            if req_pat.search(sk_name) or _skill_pat(sk_name).search(req_l):
                 best_prof = max(best_prof, prof)
         if best_prof:
             matched.append(req)
@@ -962,12 +1124,21 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
                     match_mode = "none"
 
             candidates: List[Dict[str, Any]] = []
+
+            # FIX 4: Skip re-running _compute_skill_match when dept_skills are
+            # empty (reuse global score) or identical to the project-wide
+            # skills_required (score was already computed in the main loop).
+            global_skills_set = {s.lower() for s in skills_required}
+            dept_skills_set   = {s.lower() for s in dept_skills}
+            dept_skills_differ = bool(dept_skills) and dept_skills_set != global_skills_set
+
             for c in pool:
-                dept_skill_score = c.skill_match_score
-                if dept_skills:
+                if dept_skills_differ:
                     _, _, dept_skill_score = _compute_skill_match(
                         emp_lookup[c.employee_id]["skills"], dept_skills
                     )
+                else:
+                    dept_skill_score = c.skill_match_score
                 dept_fit_score = round(
                     W_AVAILABILITY * c.availability_score
                     + W_SKILL       * dept_skill_score

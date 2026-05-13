@@ -1,5 +1,5 @@
 """
-server.py — MCP Server: Resource-Planner-Server  (v2)
+server.py — MCP Server: Resource-Planner-Server  (v3)
 ======================================================
 Run locally:
     python server.py
@@ -11,6 +11,11 @@ The UI payload now contains the following top-level sections:
     disqualified  — employees excluded (HARD or SOFT), with reasons
     departments   — department-wise recommendations (if provided)
     pipeline_warnings — non-fatal processing errors
+
+v3 changes:
+    • Input length guard: inputs over MAX_INPUT_CHARS (default 4 000, env-
+      configurable) are truncated at a sentence boundary before entering the
+      pipeline.  A warning is surfaced in pipeline_warnings.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import logging
 import sys
 import os
 from datetime import date
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -85,15 +90,18 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Summary ───────────────────────────────────────────────────────────
     top_fit        = candidates[0]["fit_score"] if candidates else 0.0
-    top_reliability = max((c["reliability_score"] for c in candidates), default=0.0)
 
-    overalloc_count     = sum(1 for c in candidates if c["overallocation_flag"])
-    with_leave_count    = sum(1 for c in candidates if c["leave_overlap_pct"] > 0)
-    with_bounty_issues  = sum(
-        1 for c in candidates
-        if (c["bounty_summary"].get("overdue", 0) or
-            c["bounty_summary"].get("effectively_overdue", 0))
-    )
+    # FIX 5: Compute all summary stats in a single pass over candidates
+    # instead of five separate sum()/max() calls that each traverse the list.
+    top_reliability = overalloc_count = with_leave_count = with_bounty_issues = 0
+    for c in candidates:
+        top_reliability   = max(top_reliability, c["reliability_score"])
+        overalloc_count  += c["overallocation_flag"]
+        with_leave_count += c["leave_overlap_pct"] > 0
+        with_bounty_issues += bool(
+            c["bounty_summary"].get("overdue") or
+            c["bounty_summary"].get("effectively_overdue")
+        )
     hard_disq = sum(1 for d in disqualified if d["disqualification_type"] == "HARD")
     soft_disq = sum(1 for d in disqualified if d["disqualification_type"] == "SOFT")
 
@@ -245,7 +253,35 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ── MCP Tool ──────────────────────────────────────────────────────────────────
+# Maximum characters forwarded to the LLM / heuristic parser.
+# gpt-4o-mini's context window is large, but very long pastes (full SOWs,
+# email threads) add latency and cost without improving extraction quality.
+# Inputs over this limit are truncated at a sentence boundary if possible,
+# or hard-truncated otherwise.  A warning is added to pipeline_warnings.
+_MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "4000"))
+
+
+def _truncate_input(text: str, limit: int) -> Tuple[str, Optional[str]]:
+    """
+    Truncate *text* to *limit* characters, preferring a sentence boundary.
+    Returns (truncated_text, warning_message | None).
+    """
+    if len(text) <= limit:
+        return text, None
+    # Try to cut at the last sentence-ending punctuation before the limit.
+    boundary = max(
+        text.rfind(". ", 0, limit),
+        text.rfind(".\n", 0, limit),
+        text.rfind("! ",  0, limit),
+        text.rfind("? ",  0, limit),
+    )
+    cut = (boundary + 1) if boundary > limit // 2 else limit
+    truncated = text[:cut].rstrip()
+    warning = (
+        f"Input truncated from {len(text):,} to {len(truncated):,} characters "
+        f"(limit: {limit:,}).  Extraction may be incomplete."
+    )
+    return truncated, warning
 
 @mcp.tool()
 def analyze_resource_allocation(project_description: str) -> str:
@@ -280,15 +316,25 @@ def analyze_resource_allocation(project_description: str) -> str:
     if not project_description or not project_description.strip():
         return json.dumps({"error": "project_description must not be empty.", "candidates": []})
 
+    # FIX #6: guard against oversized inputs that would exceed the LLM context
+    # window or add unnecessary latency.  Truncation is logged and surfaced in
+    # pipeline_warnings so callers know extraction may be incomplete.
+    truncation_warning: Optional[str] = None
+    project_description, truncation_warning = _truncate_input(
+        project_description.strip(), _MAX_INPUT_CHARS
+    )
+    if truncation_warning:
+        logger.warning("Input truncated: %s", truncation_warning)
+
     try:
         initial_state = {
-            "raw_project_input":       project_description.strip(),
+            "raw_project_input":       project_description,
             "extracted_requirements":  None,
             "raw_erp_data":            None,
             "processed_metrics":       None,
             "ranked_candidates":       None,
             "disqualified_candidates": None,
-            "errors":                  [],
+            "errors":                  ([truncation_warning] if truncation_warning else []),
         }
         final_state = app.invoke(initial_state)
         payload     = _build_ui_payload(final_state)

@@ -176,7 +176,7 @@ def run_assertions(p: Dict) -> None:
          "start_date": (proj_start + timedelta(days=4)).isoformat(),    # 6 days overlap
          "end_date":   (proj_start + timedelta(days=14)).isoformat()},  # 11 days
     ]
-    ld = _compute_leave_overlap(leaves_overlap, "T", proj_start, proj_end)
+    ld = _compute_leave_overlap(leaves_overlap, proj_start, proj_end)
     check("BUG#1 — overlapping leave periods don't double-count (expect 15d)",
           ld.overlap_days == 15,
           f"got {ld.overlap_days}")
@@ -217,7 +217,7 @@ def run_assertions(p: Dict) -> None:
                     "description": "", "hours_estimated": 5.0, "status": "not_started",
                     "due_date": (today + timedelta(days=14)).isoformat(),
                     "completed_date": None}]
-    bm_fut = _compute_bounty_metrics(future_task, "X", today)
+    bm_fut = _compute_bounty_metrics(future_task, today)
     check("BUG#3 — single future not_started → reliability = 70 (neutral)",
           bm_fut.reliability_score == 70.0,
           f"got {bm_fut.reliability_score}")
@@ -282,7 +282,7 @@ def run_assertions(p: Dict) -> None:
               [{"employee_id": "T", "leave_type": "PTO",
                 "start_date": (proj_start - timedelta(days=20)).isoformat(),
                 "end_date":   (proj_start - timedelta(days=1)).isoformat()}],
-              "T", proj_start, proj_end
+              proj_start, proj_end
           ).overlap_days == 0,
           "pre-project leave should not overlap")
 
@@ -291,7 +291,7 @@ def run_assertions(p: Dict) -> None:
               [{"employee_id": "T", "leave_type": "PTO",
                 "start_date": (proj_end + timedelta(days=1)).isoformat(),
                 "end_date":   (proj_end + timedelta(days=14)).isoformat()}],
-              "T", proj_start, proj_end
+              proj_start, proj_end
           ).overlap_days == 0,
           "post-project leave should not overlap")
 
@@ -300,7 +300,7 @@ def run_assertions(p: Dict) -> None:
               [{"employee_id":"E","bounty_id":f"B{i}","title":f"T{i}","description":"",
                 "hours_estimated":5.0,"status":"overdue",
                 "due_date":(today-timedelta(days=10)).isoformat(),"completed_date":None}
-               for i in range(3)], "E", today
+               for i in range(3)], today
           ).reliability_score == 0.0,
           "")
 
@@ -309,7 +309,7 @@ def run_assertions(p: Dict) -> None:
               [{"employee_id":"E","bounty_id":"B1","title":"Late","description":"",
                 "hours_estimated":8.0,"status":"in_progress",
                 "due_date":(today-timedelta(days=3)).isoformat(),"completed_date":None}],
-              "E", today
+              today
           ).effectively_overdue == 1,
           "")
 
