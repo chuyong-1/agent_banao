@@ -1,36 +1,160 @@
-# Intelligent Staffing & Resource Planner
+# Resource Availability Planner — Technical Documentation
 
-Traditional staffing systems often rely solely on current availability and baseline skills. This planner goes further by evaluating leave conflicts, historical reliability, active "bounty" workload pressure, and overallocation risks to generate highly accurate candidate recommendations.
+> **Version:** v4 (nodes) / v3 (server, mock_data) / v2 (state, stress_test)
+> **Last Updated:** Based on source files reviewed May 2026
 
-## 🚀 Features
+---
 
-* **Advanced Availability & Workload Tracking:** Factors in both standard project assignments and side-tasks (bounties).
-* **Dynamic Skill Matching:** Intelligently matches extracted skills with required skills, preventing inflation from duplicate requirements.
-* **Department-wise Planning:** Parses department-specific skills and headcount, returning recommendations per department.
-* **Department-only Mode:** Optional strict filtering to only consider listed departments.
-* **Reliability Scoring:** Evaluates delivery history, rewarding consistency and penalizing overdue work.
-* **Leave Conflict Resolution:** Calculates leave overlap percentages to prevent scheduling conflicts.
-* **Smart Heuristic Extraction:** Falls back to regex-based tech extraction if the LLM is unavailable.
+## Table of Contents
 
-## How It Works
+1. [Project Overview](#1-project-overview)
+2. [File Directory](#2-file-directory)
+3. [System Architecture](#3-system-architecture)
+4. [Input Points](#4-input-points)
+5. [Output Points](#5-output-points)
+6. [Pipeline — Node-by-Node Breakdown](#6-pipeline--node-by-node-breakdown)
+7. [Formulas & Scoring Logic](#7-formulas--scoring-logic)
+8. [Disqualification Logic](#8-disqualification-logic)
+9. [Status Badge System](#9-status-badge-system)
+10. [Performance & Caching](#10-performance--caching)
+11. [Configuration & Environment Variables](#11-configuration--environment-variables)
+12. [Data Schemas](#12-data-schemas)
+13. [Testing](#13-testing)
+14. [Known Bug Fixes & Design Decisions](#14-known-bug-fixes--design-decisions)
+15. [Tech Stack & Dependencies](#15-tech-stack--dependencies)
 
-1. **Extract requirements** from the input (skills, dates, hours, and optional department-wise headcount).
-2. **Load ERP data** (employees, assignments, leave, and bounties).
-3. **Compute per-employee metrics** (availability, leave overlap, bounty reliability, and overallocation flags).
-4. **Rank candidates** using a weighted fit score and separate hard/soft disqualifications.
-5. **Produce department recommendations** when department-wise requirements are provided, and optionally enforce department-only filtering.
+---
 
-## What It Accounts For
+## 1. Project Overview
 
-* **All current work**: active project assignments plus in-progress bounty workload.
-* **Leave conflicts**: merged leave windows to avoid double-counting overlap days.
-* **Delivery reliability**: overdue and effectively overdue bounties reduce the score.
-* **Overallocation risk**: employees above 100% utilization are flagged or disqualified.
-* **Department needs**: optional department headcount and skill mapping.
+The **Resource Availability Planner** is an AI-powered staffing tool that accepts a free-form project description and returns a ranked list of best-fit employees. Unlike traditional staffing systems that only check calendar availability, this planner evaluates five dimensions simultaneously:
 
-## Department-wise Input Examples
+- **Availability** — actual free hours after accounting for both project assignments and active side-task (bounty) workload
+- **Skill match** — weighted proficiency alignment against required skills
+- **Delivery reliability** — historical track record from bounty completion history
+- **Leave conflict** — approved leave overlapping the project window (with interval-merging to prevent double-counting)
+- **Overallocation risk** — employees exceeding 100% utilisation are flagged or hard-excluded
 
-Basic list with headcount:
+The system is exposed as a **Model Context Protocol (MCP) tool**, making it callable by any MCP-compatible AI agent or application.
+
+---
+
+## 2. File Directory
+
+| File | Role | Key Responsibility |
+|---|---|---|
+| `server.py` | **Entry point / MCP server** | Exposes the `analyze_resource_allocation` tool via FastMCP (stdio transport). Handles input truncation, invokes the LangGraph pipeline, and shapes the final UI payload. |
+| `graph.py` | **Pipeline wiring** | Builds and compiles the LangGraph `StateGraph`. Connects the four node functions in linear order and exports the compiled `app` object. |
+| `nodes.py` | **Core processing logic** | Contains all four node functions plus every helper: skill extraction, leave overlap, bounty metrics, skill matching, and the matchmaker ranking engine. The most complex file (~1 200 lines). |
+| `state.py` | **Data contracts** | Defines all Pydantic models and TypedDicts used as the shared graph state. Acts as the single source of truth for data shapes across all nodes. |
+| `mock_data.py` | **Development dataset** | Provides a realistic 10-employee mock HR/ERP dataset with edge-case employees (overlapping leave periods, zero-capacity employee) for testing. Dates are computed dynamically at import time to stay current. |
+| `requirements.txt` | **Dependency manifest** | Lists all Python packages needed to run the pipeline (LangGraph, LangChain, Pydantic, MCP, OpenAI, dateutil). |
+| `test_pipeline.py` | **Functional test suite** | 4 realistic project scenarios + 15 targeted edge-case assertions covering every bug fix. Runs without pytest — executes directly via `python test_pipeline.py`. |
+| `stress_test.py` | **Load & performance tests** | 5 benchmarks: sequential latency (cold vs. warm), concurrent throughput, employee-count scaling, timeout/fallback validation, and cache staleness demonstration. |
+| `view_graph.py` | **Visualisation utility** | Prints the compiled LangGraph pipeline as a Mermaid.js flowchart — useful for debugging or documentation generation. |
+| `readme` | **User-facing README** | Quick-start guide, feature overview, input examples, formula summary, and badge reference. |
+
+---
+
+## 3. System Architecture
+
+### 3.1 High-Level Flow
+
+```
+User / AI Agent
+     │
+     │  project_description (free text)
+     ▼
+┌─────────────────────────────────────────────┐
+│              server.py (MCP)                │
+│  analyze_resource_allocation()              │
+│  • Input length guard (≤ MAX_INPUT_CHARS)   │
+│  • Invokes LangGraph app                    │
+│  • Builds and returns UI payload            │
+└──────────────────┬──────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────┐
+│           LangGraph Pipeline                │
+│                                             │
+│  ┌───────────────────┐                      │
+│  │  Node 1           │                      │
+│  │  extract_intent   │  text → requirements │
+│  └────────┬──────────┘                      │
+│           │                                 │
+│  ┌────────▼──────────┐                      │
+│  │  Node 2           │                      │
+│  │  ingest_erp_data  │  load HR/ERP data    │
+│  └────────┬──────────┘                      │
+│           │                                 │
+│  ┌────────▼──────────┐                      │
+│  │  Node 3           │                      │
+│  │  compute_metrics  │  per-employee scores │
+│  └────────┬──────────┘                      │
+│           │                                 │
+│  ┌────────▼──────────┐                      │
+│  │  Node 4           │                      │
+│  │  matchmaker       │  rank + disqualify   │
+│  └───────────────────┘                      │
+└─────────────────────────────────────────────┘
+                   │
+                   ▼
+         Structured JSON payload
+         (meta / summary / candidates /
+          disqualified / departments /
+          pipeline_warnings)
+```
+
+### 3.2 State Object — Shared Graph Memory
+
+All four nodes communicate through a shared `GraphState` TypedDict. Each node reads from it and writes only its own output keys; no node mutates another node's output.
+
+```
+GraphState
+├── raw_project_input          ← set by caller
+├── extracted_requirements     ← written by Node 1
+├── raw_erp_data               ← written by Node 2
+├── processed_metrics          ← written by Node 3
+├── ranked_candidates          ← written by Node 4
+├── disqualified_candidates    ← written by Node 4
+├── department_recommendations ← written by Node 4
+└── errors                     ← appended by any node
+```
+
+### 3.3 LLM vs. Heuristic Extraction
+
+Node 1 has two code paths:
+
+- **LLM path** — used when `OPENAI_API_KEY` is set. Sends the text to `gpt-4o-mini` via LangChain with structured output (Pydantic model). Results are LRU-cached keyed on `(normalised_text + today's date)`.
+- **Heuristic path** — pure regex/keyword fallback used when no API key is present or the LLM call fails. Parses dates, durations, hours, skills (via COMPILED_ALIASES), and department requirements from the raw text. Always available; no external dependency.
+
+---
+
+## 4. Input Points
+
+### 4.1 Primary Input — MCP Tool Call
+
+**Tool name:** `analyze_resource_allocation`
+**Parameter:** `project_description` (string, required, non-empty)
+
+The input is any free-form text describing a project. Supported formats include Jira tickets, Slack messages, SOW excerpts, or plain English. The system extracts the following fields from it:
+
+| Extracted Field | Default if Missing | Notes |
+|---|---|---|
+| `skills_required` | `["Unspecified Technical Skill"]` | Flat list; deduplicated |
+| `department_requirements` | `[]` | Only populated when "department-wise" text is detected |
+| `department_only` | `false` | Set to `true` if "department only" phrasing is found |
+| `start_date` | Today + 2 weeks | ISO-8601 format |
+| `duration_weeks` | 8 | Minimum 1 |
+| `hours_per_week` | 20.0 | Range: 1–60; "full-time" → 40, "half-time" → 20 |
+
+**Input length limit:** 4,000 characters by default (configurable via `MAX_INPUT_CHARS` env var). Inputs exceeding this are truncated at a sentence boundary; a warning is surfaced in `pipeline_warnings`.
+
+### 4.2 Department-Wise Input Syntax
+
+The heuristic parser recognises three department input patterns:
+
+**Bulleted list with headcount:**
 ```
 Department-wise
 Python Django - 2 people
@@ -38,86 +162,612 @@ Manual Testing - 3 people
 Digital Marketing - 1
 ```
 
-Department list with skills inline:
+**Inline skills per department:**
 ```
 Department-wise
-Department-only staffing required
 MERN Stack team - 2
 React Native - 1 person
 UI / UX Designing - 2
 ```
 
-Single-line list (comma-separated):
+**Single-line comma-separated:**
 ```
 Department-wise: Accounting - 1, Human Resources - 2, Business Analysis - 1
 ```
 
-## Dataset Examples (from mock_data.py)
+### 4.3 ERP Data Input
 
-Employees include department labels used for matching:
+HR/ERP data is loaded inside Node 2 via `_load_erp_data()`:
+
+- **Mock data (default):** `MOCK_ERP_DATA` from `mock_data.py` — 10 employees, pre-built assignments, leaves, and bounties.
+- **Real data:** Set `ERP_DATA_PATH=/path/to/erp_data.json` to load a JSON file conforming to the `ERPData` schema (keys: `employees`, `assignments`, `leaves`, `bounties`). If the file cannot be read, the pipeline falls back to mock data and logs a warning rather than crashing.
+
+---
+
+## 5. Output Points
+
+### 5.1 JSON Payload Structure
+
+The tool returns a single JSON string with six top-level keys:
+
+```json
+{
+  "meta": { ... },
+  "summary": { ... },
+  "candidates": [ ... ],
+  "disqualified": [ ... ],
+  "departments": [ ... ],
+  "pipeline_warnings": [ ... ]
+}
 ```
-EMP-001  Aisha Patel     - Platform Engineering
-EMP-002  Marcus Chen     - AI/ML
-EMP-003  Sofia Rossi     - Product Engineering
-EMP-004  Jamal Williams  - Infrastructure
-EMP-006  Ravi Nair       - Data Platform
+
+#### `meta` — Project Requirements
+```json
+{
+  "generated_at": "2026-05-13",
+  "project_requirements": {
+    "skills_required": ["Python", "FastAPI"],
+    "department_requirements": [],
+    "department_only": false,
+    "start_date": "2026-05-27",
+    "duration_weeks": 8,
+    "hours_per_week": 20,
+    "total_hours": 160
+  }
+}
 ```
 
-## 🧮 Core Evaluation Formulas
+#### `summary` — Aggregate Stats
+```json
+{
+  "total_evaluated": 10,
+  "candidates_eligible": 7,
+  "candidates_disqualified": 3,
+  "disqualified_hard": 2,
+  "disqualified_soft": 1,
+  "candidates_overallocated": 1,
+  "candidates_with_leave": 2,
+  "candidates_with_bounty_issues": 1,
+  "top_fit_score": 88.5,
+  "top_reliability_score": 95.0,
+  "recommendation": "✅ Strong candidates available — proceed with selection.",
+  "scoring_weights": {
+    "availability": "45%",
+    "skill_match": "30%",
+    "reliability": "25%"
+  }
+}
+```
 
-The system uses a weighted, multi-metric approach to evaluate and rank employees.
+**Recommendation thresholds:**
 
-### 1. Availability Score
-Determines true working capacity.
-* `Effective Assigned Hours = Assignment Hours + (Total Active Bounty Hours / 2)`
-* `Availability Score = 100 - ((Effective Assigned Hours / Capacity Hours) * 100)`
+| Top Fit Score | Recommendation |
+|---|---|
+| ≥ 70 | ✅ Strong candidates available |
+| 40–69 | ⚠️ Limited availability — consider timeline adjustment |
+| < 40 | 🚫 No well-matched candidates — escalate to resource manager |
 
-### 2. Skill Match Score
-Measures alignment with project requirements using proficiency.
-* `Skill Match Score = (Sum of best-match proficiencies) / (5 × Required Skills) × 100`
+#### `candidates` — Ranked Eligible Employees
 
-### 3. Reliability Score
-Evaluates delivery history.
-* `Actionable = Completed + Problematic`
-* `Base Score = (Completed / max(1, Actionable)) × 100`
-* `Reliability Score = clamp(Base Score - Penalties + Bonuses, 0, 100)`
-  * *Penalties:* -15 points per overdue, -5 points per effectively overdue.
-  * *Bonuses:* +5 points for strong consistency (high base with enough history).
-  * *Neutral:* If no actionable tasks exist, reliability defaults to 70.
+Each candidate card contains:
 
-### 4. Leave Overlap
-Calculates how much approved leave overlaps the project window.
-* `Overlap % = (Merged Overlap Days / Project Days) × 100`
+```json
+{
+  "rank": 1,
+  "employee_id": "EMP-001",
+  "name": "Aisha Patel",
+  "role": "Senior Backend Engineer",
+  "department": "Platform Engineering",
+  "hourly_rate_usd": 95.0,
+  "status_badge": "IDEAL",
+  "status_icon": "🟢",
+  "scores": {
+    "fit_score": 88.5,
+    "availability_score": 90.0,
+    "skill_match_score": 85.0,
+    "reliability_score": 95.0
+  },
+  "skills": {
+    "matched": ["Python", "FastAPI"],
+    "missing": [],
+    "coverage_pct": 100.0
+  },
+  "availability": {
+    "available_hours_per_week": 32.0,
+    "projected_free_date": "2026-06-01",
+    "overallocation_flag": false
+  },
+  "leave": {
+    "has_overlap": false,
+    "overlap_pct": 0,
+    "overlap_days": 0,
+    "severity": "NONE"
+  },
+  "bounties": {
+    "total_assigned": 5,
+    "completed": 4,
+    "in_progress": 1,
+    "not_started": 0,
+    "overdue": 0,
+    "effectively_overdue": 0,
+    "active_drain_h_wk": 2.5,
+    "reliability_score": 95.0
+  },
+  "match_reasons": ["Matches 2/2 required skills: Python, FastAPI", "High availability (90/100)"],
+  "warnings": []
+}
+```
 
-### 5. Final Fit Score
-Produces a single normalized ranking score.
-* `Fit Score = 0.45(Availability) + 0.30(Skill Match) + 0.25(Reliability)`
+**Leave severity levels:**
 
-## 🚦 Candidate Status Logic
+| Value | Condition |
+|---|---|
+| `NONE` | overlap_pct = 0 |
+| `PARTIAL` | overlap_pct > 0 and < 25 |
+| `NOTABLE` | overlap_pct ≥ 25 |
 
-| Badge | Criteria |
-| :--- | :--- |
-| **`IDEAL`** | High fit score, no leave overlap, not overallocated. |
-| **`AVAILABLE`** | Strong fit score, minor or no conflicts. |
-| **`PARTIAL_FIT`** | Moderate skill match or slight availability limits. |
-| **`LEAVE_OVERLAP`** | Employee has a scheduled leave conflict. |
-| **`AT_RISK`** | Employee is overallocated. |
+#### `disqualified` — Excluded Employees
 
-## 🛠 Tech Stack
+Each disqualified entry shows exactly why someone was excluded:
 
-* **Workflow Engine:** LangGraph
-* **LLM Orchestration:** LangChain
-* **API Server:** MCP / FastMCP
-* **Validation:** Pydantic
-* **Language & Testing:** Python, Pytest
+```json
+{
+  "employee_id": "EMP-009",
+  "name": "Alex Morgan",
+  "role": "...",
+  "department": "...",
+  "disqualification_type": "HARD",
+  "disqualification_reason": "HARD: Leave covers 100% of the project window ...",
+  "leave_overlap_pct": 100.0,
+  "leave_overlap_days": 56,
+  "overallocation_flag": false,
+  "bounties": { "total": 3, "completed": 2, "overdue": 0, "reliability": 70.0 }
+}
+```
 
-## ⚙️ Getting Started
+#### `departments` — Department-Wise Recommendations
 
-### Prerequisites
-Make sure you have Python 3.8+ installed.
+Only populated when department requirements were parsed from the input:
+
+```json
+{
+  "department": "Platform Engineering",
+  "people_required": 2,
+  "people_available": 3,
+  "people_shortage": 0,
+  "skills_required": ["Python", "FastAPI"],
+  "match_mode": "department",
+  "recommended": [ { ...candidate_details... } ]
+}
+```
+
+`match_mode` values:
+
+| Value | Meaning |
+|---|---|
+| `department` | Candidates found in the requested department |
+| `department_only` | `department_only=true`; only in-department candidates considered |
+| `skills_fallback` | No in-department candidates; fell back to skill-based matching |
+| `none` | No candidates found by either strategy |
+
+#### `pipeline_warnings`
+
+A list of non-fatal issues encountered during processing, such as LLM fallback events, input truncation, or ERP data load failures.
+
+---
+
+## 6. Pipeline — Node-by-Node Breakdown
+
+### Node 1 — `extract_intent_node`
+
+**Input from state:** `raw_project_input`
+**Output to state:** `extracted_requirements`, `errors`
+
+Attempts LLM extraction first (if `OPENAI_API_KEY` is set); falls back to regex heuristics on failure. The result is an `ExtractedRequirements` Pydantic model serialised to a dict.
+
+**Skill alias normalisation:** 40+ compiled regex patterns map common variants to canonical skill names (e.g., `postgres` → `PostgreSQL`, `k8s` → `Kubernetes`, `ml` → `Machine Learning`). Patterns are pre-compiled at module load for performance.
+
+**Department parsing:** Separate sub-parser (`_parse_department_requirements`) handles multi-line bulleted lists, inline comma-separated lists, and single-line formatted strings. Duplicate department entries are merged (headcounts added, skills deduplicated).
+
+---
+
+### Node 2 — `ingest_erp_data_node`
+
+**Input from state:** `extracted_requirements` (indirectly, for context)
+**Output to state:** `raw_erp_data`
+
+Loads and validates HR/ERP data via `_load_erp_data()`. The `ERPData` Pydantic model enforces schema correctness at this boundary. All downstream nodes receive validated, typed data.
+
+---
+
+### Node 3 — `compute_metrics_node`
+
+**Input from state:** `raw_erp_data`, `extracted_requirements`
+**Output to state:** `processed_metrics` (list of `EmployeeMetrics` dicts)
+
+This is the compute-intensive node. For each employee it calculates:
+
+1. **Assignment load** — sum of `hours_per_week` across all active assignments (those ending on or after `proj_start`)
+2. **Bounty metrics** — via `_compute_bounty_metrics()` (see §7)
+3. **Effective load** — assignment hours + urgency-weighted bounty drain
+4. **Availability score** — derived from utilisation percentage
+5. **Leave overlap** — via `_compute_leave_overlap()` with interval merging (see §7)
+6. **Projected free date** — day after the latest active assignment end date
+7. **Disqualification check** — applies hard/soft rules and sets flags
+
+**Performance note:** Leaves and bounties are pre-indexed by `employee_id` (O(n) once) before the per-employee loop, avoiding the O(n²) scan that existed in earlier versions.
+
+---
+
+### Node 4 — `matchmaker_node`
+
+**Input from state:** `processed_metrics`, `extracted_requirements`, `raw_erp_data`
+**Output to state:** `ranked_candidates`, `disqualified_candidates`, `department_recommendations`
+
+For each non-disqualified employee:
+
+1. Computes skill match via `_compute_skill_match()` (see §7)
+2. Calculates the composite `fit_score`
+3. Generates human-readable `match_reasons` and `warnings`
+4. Pushes disqualified employees to the separate disqualified list
+
+After processing all employees, the candidates list is sorted descending by `(fit_score, reliability_score, skill_match_score)` and ranks are assigned 1-based.
+
+If department requirements were provided, a second pass generates per-department recommendations from the already-ranked candidate pool.
+
+---
+
+## 7. Formulas & Scoring Logic
+
+### 7.1 Effective Assigned Hours
+
+Represents the true weekly workload after accounting for both project assignments and in-progress bounty tasks.
+
+```
+Effective Assigned Hours = Assignment Hours + Active Bounty Hours (weekly, urgency-weighted)
+```
+
+**Urgency-weighted bounty drain** (applied per in-progress bounty):
+
+```
+days_remaining  = max(0, due_date - today)
+drain_weeks     = clamp(days_remaining / 7, 0.5, 4.0)
+bounty_drain    = hours_estimated / drain_weeks
+```
+
+This means a bounty due tomorrow applies 2× more weekly pressure than one due in 2 weeks, and 4× more than one due in 4 weeks. The old approach used a fixed 2-week spread regardless of urgency.
+
+---
+
+### 7.2 Availability Score
+
+```
+Utilisation %      = (Effective Assigned Hours / Capacity Hours) × 100
+Availability Score = clamp(100 − Utilisation %, 0, 100)
+```
+
+A fully free employee scores 100; a fully loaded employee scores 0. Employees over 100% utilisation are flagged (`overallocation_flag = true`).
+
+**Special case:** If `capacity_hours_per_week = 0` (inactive employee / on leave of absence), the employee is immediately hard-disqualified with `availability_score = 0`.
+
+---
+
+### 7.3 Skill Match Score
+
+```
+For each required skill:
+    find the highest proficiency (1–5) among the employee's skills
+    that match via word-boundary regex (bidirectional)
+
+Skill Match Score = (sum of best-match proficiencies) / (5 × unique_skills_required) × 100
+```
+
+**Word-boundary matching** prevents false positives like `"Go"` matching `"Django"`, or `"Java"` matching `"JavaScript"`. Bidirectional matching is retained so `"PostgreSQL"` still matches an employee with skill `"PostgreSQL DBA"`.
+
+**Deduplication:** Required skills are deduplicated before scoring so duplicates in the extracted list do not inflate the denominator.
+
+---
+
+### 7.4 Reliability Score
+
+Based on the employee's bounty history. Only "actionable" bounties (completed + problematic) contribute to the base rate; future neutral tasks do not penalise employees who simply have upcoming work.
+
+```
+actionable        = completed + total_problematic
+                    where total_problematic = overdue + effectively_overdue
+
+base              = (completed / max(1, actionable)) × 100
+penalty           = min(base, (15 × overdue) + (5 × effectively_overdue))
+consistency_bonus = +5 if (base > 90% AND actionable ≥ 3) else 0
+reliability_score = clamp(base − penalty + consistency_bonus, 0, 100)
+```
+
+**Neutral score:** If `actionable = 0` (no completed or problematic bounties, only future/neutral work), `reliability_score = 70` (a neutral starting assumption — no positive or negative evidence).
+
+**Effectively overdue definition:** A bounty is "effectively overdue" if its `due_date < today` and its status is `in_progress` or `not_started` (i.e., the system hasn't marked it overdue yet but it is past deadline).
+
+**Why these penalties?**
+- Explicitly marked `OVERDUE`: −15 pts (strong signal — system confirmed it)
+- `effectively_overdue`: −5 pts (soft signal — may have extenuating circumstances)
+- The `min(base, penalty)` cap prevents the score from going negative from penalties alone
+
+---
+
+### 7.5 Leave Overlap
+
+```
+For each leave record overlapping the project window:
+    clip_start = max(leave_start, project_start)
+    clip_end   = min(leave_end,   project_end)
+    if clip_start ≤ clip_end: add (clip_start, clip_end) to interval list
+
+Merge overlapping/adjacent intervals (prevents double-counting)
+total_overlap_days = sum of calendar days in merged intervals
+overlap_pct        = clamp(total_overlap_days / project_total_days × 100, 0, 100)
+```
+
+**Why interval merging?** Without it, two leave records that overlap each other within the project window would be double-counted, overstating the conflict percentage. The merge step (sort intervals, then extend the current interval or start a new one) guarantees each calendar day is counted at most once.
+
+---
+
+### 7.6 Composite Fit Score
+
+The final score used for ranking eligible candidates:
+
+```
+Fit Score = 0.45 × Availability Score
+          + 0.30 × Skill Match Score
+          + 0.25 × Reliability Score
+```
+
+**Why these weights?**
+
+Availability carries the highest weight (45%) because a perfectly skilled but unavailable employee cannot contribute. Skill match (30%) is next — a technically capable person requires less ramp-up time. Reliability (25%) serves as a tie-breaker and risk signal; a high-availability, high-skill employee with poor delivery history is still a meaningful risk.
+
+**Department fit score** (used only for department recommendations, not global ranking):
+
+```
+Department Fit Score = 0.45 × Availability Score
+                     + 0.30 × Department-Specific Skill Score
+                     + 0.25 × Reliability Score
+```
+
+The department skill score is re-computed only if the department's skill requirements differ from the global requirements; otherwise the pre-computed score is reused.
+
+---
+
+## 8. Disqualification Logic
+
+Disqualification is determined in Node 3 and enforced in Node 4. Disqualified employees are surfaced explicitly in the output (not silently dropped) with a plain-English reason and a type label (`HARD` or `SOFT`).
+
+| Condition | Type | Rule |
+|---|---|---|
+| `capacity_hours_per_week = 0` | **HARD** | Employee is inactive; cannot receive work |
+| `leave_overlap_pct ≥ 100%` | **HARD** | Employee is on leave for the entire project window |
+| `utilisation > 100% AND available_hours ≤ 0` | **HARD** | Over-allocated with literally zero free hours |
+| `leave_overlap_pct ≥ 50%` | **SOFT** | Employee is on leave for more than half the project window |
+
+HARD disqualifications are absolute exclusions. SOFT disqualifications are surfaced as a separate list so managers can make an informed override decision.
+
+---
+
+## 9. Status Badge System
+
+Each eligible candidate is assigned a status badge computed from their scores and flags:
+
+| Badge | Icon | Criteria |
+|---|---|---|
+| `IDEAL` | 🟢 | `fit_score ≥ 75` AND no overallocation AND no leave overlap |
+| `AVAILABLE` | 🔵 | `fit_score ≥ 60` |
+| `AT_RISK` | 🔴 | `overallocation_flag = true` |
+| `LEAVE_OVERLAP` | 🟠 | `leave_overlap_pct > 0` |
+| `PARTIAL_FIT` | 🟡 | Does not meet any of the above criteria |
+
+Conditions are checked in order — the first match wins.
+
+---
+
+## 10. Performance & Caching
+
+### 10.1 LRU Cache for LLM Extraction
+
+`_cached_llm_extract` is decorated with `@lru_cache` to avoid redundant API calls for identical inputs.
+
+- **Cache key:** `normalised_text + "\x00" + today's date` — the date suffix ensures that prompts with defaulted start dates (`"2 weeks from today"`) are never served from a cache entry made on a previous calendar day.
+- **Cache size:** Configurable via `LLM_CACHE_SIZE` env var (default: 256). Set to `0` to disable.
+- **Thread safety:** CPython GIL makes LRU cache reads thread-safe.
+- **Cache is process-local** — not shared across workers or restarts.
+
+### 10.2 Compiled Regex Patterns
+
+All 40+ skill alias regex patterns (`COMPILED_ALIASES`) are compiled once at module load time using `re.compile(pat, re.IGNORECASE)`. Per-call compilation of the same patterns (the pre-fix behaviour) was a measurable overhead under load.
+
+Skill word-boundary patterns for `_compute_skill_match` are compiled lazily per unique skill name and cached in a local dict within the call, so repeated calls with the same skill set avoid recompilation.
+
+### 10.3 Data Indexing
+
+In Node 3, leaves and bounties are indexed by `employee_id` in a single O(n) pass before the per-employee loop. This eliminates the O(n²) full-scan that existed in earlier versions.
+
+### 10.4 Summary Stats
+
+In the server's `_build_ui_payload`, the five aggregate summary statistics (top reliability, overalloc count, leave count, bounty issue count, hard/soft disqualified counts) are computed in a single pass over the candidates list rather than five separate iterations.
+
+### 10.5 Benchmark Targets (from stress_test.py)
+
+| Metric | Target (heuristic mode) | Target (LLM mode) |
+|---|---|---|
+| Cold invocation p50 | < 20 ms | < 3,000 ms |
+| Warm invocation p50 | < 5 ms | < 500 ms (cache hit) |
+| Cold invocation p99 | < 100 ms | < 8,000 ms |
+
+---
+
+## 11. Configuration & Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | *(unset)* | If set, enables GPT-4o-mini LLM extraction. If unset or if the LLM call fails, the heuristic fallback is used. |
+| `ERP_DATA_PATH` | *(unset)* | Path to a real ERP JSON file. If unset or unreadable, falls back to mock data. |
+| `LLM_CACHE_SIZE` | `256` | Maximum number of LLM responses cached in memory. Set to `0` to disable. |
+| `MAX_INPUT_CHARS` | `4000` | Maximum characters forwarded to the extraction step. Longer inputs are truncated at a sentence boundary. |
+
+---
+
+## 12. Data Schemas
+
+### 12.1 Employee
+
+```
+id                       : str           — unique identifier (e.g. "EMP-001")
+name                     : str
+role                     : str
+department               : str
+capacity_hours_per_week  : float         — contractual weekly hours
+skills                   : List[{name, proficiency (1–5)}]
+hourly_rate_usd          : float
+```
+
+### 12.2 Assignment
+
+```
+assignment_id   : str
+employee_id     : str
+project_name    : str
+hours_per_week  : float
+start_date      : str   — ISO-8601
+end_date        : str   — ISO-8601
+```
+
+### 12.3 Leave Record
+
+```
+leave_id        : str
+employee_id     : str
+leave_type      : str   — "PTO" | "Sick" | "Parental" | "Unpaid"
+start_date      : str   — ISO-8601
+end_date        : str   — ISO-8601
+```
+
+### 12.4 Bounty
+
+```
+bounty_id        : str
+employee_id      : str
+title            : str
+description      : str
+hours_estimated  : float   (≥ 0.5)
+status           : BountyStatus — completed | in_progress | not_started | overdue
+due_date         : str          — ISO-8601
+completed_date   : str | None   — ISO-8601 or null
+```
+
+---
+
+## 13. Testing
+
+### 13.1 Functional Tests (`test_pipeline.py`)
+
+Run directly:
+```bash
+python test_pipeline.py
+```
+
+Covers:
+- 4 realistic project scenarios (Python/FastAPI stack, React/TypeScript stack, DevOps migration, data warehouse)
+- 15 targeted edge-case assertions including:
+  - Overlapping leave interval merging (EMP-009)
+  - Zero-capacity hard disqualification (EMP-010)
+  - Reliability denominator with only future tasks
+  - Skill deduplication in scoring
+  - Word-boundary regex preventing false positives (`"Go"` vs `"Django"`)
+  - Heuristic fallback for unrecognised skills
+  - `full-time` / `half-time` hours extraction
+
+### 13.2 Performance Tests (`stress_test.py`)
+
+Run directly:
+```bash
+python stress_test.py
+```
+
+Five benchmarks:
+1. **Sequential latency** — 20 invocations split into cold/warm; reports mean, p50, p95, p99, stdev
+2. **Concurrent throughput** — 4/8/16 worker threads; reports requests/second and error rate
+3. **Scale test** — varies employee count from 10 to 100; reports per-invocation latency with stdev column
+4. **Timeout/fallback** — patches `_llm_extract` to raise exceptions and verifies the heuristic fallback fires correctly and returns a valid result
+5. **Cache staleness** — demonstrates the midnight date-staleness problem and documents the fix (`date.today()` in cache key)
+
+---
+
+## 14. Known Bug Fixes & Design Decisions
+
+The table below documents all 13 numbered fixes applied across v1–v4 of `nodes.py`, plus server-side fixes:
+
+| Fix # | File | Bug | Resolution |
+|---|---|---|---|
+| #1 | nodes.py | Leave overlap double-counted overlapping intervals | Clip each leave to project window, then merge intervals before summing |
+| #2 | nodes.py | `capacity=0` → `utilization=0` → `availability_score=100` (wrong) | Zero-capacity guard: immediately hard-disqualify with `availability_score=0` |
+| #3 | nodes.py | Reliability denominator used all assigned bounties; a single future task collapsed score to ~0 | Use only `completed + problematic` (actionable) as denominator |
+| #4 | nodes.py | Heuristic skill fallback always returned `["Python"]` when no known skill matched | Extract SCREAMING_CASE / TitleCase tokens; use `"Unspecified Technical Skill"` if nothing found |
+| #5 | nodes.py | Duplicate skills in `skills_required` inflated skill match score | Deduplicate `skills_required` before scoring |
+| #6 | nodes.py | Bidirectional substring match caused `"Go"` to match `"Django"`, `"Java"` to match `"JavaScript"` | Replace with word-boundary regex matching in both directions |
+| #7 | nodes.py | `leave_periods` showed raw leave record dates, not the clipped window overlap dates | Show clipped dates; append full leave span in parentheses only when clipped |
+| #8 | nodes.py | `m.lastindex == 0` never `True` (re uses 1-based group indexing); full/half-time hours extraction always fell through | Use `m.lastindex is None` to detect no-capture-group patterns |
+| #9 | nodes.py | Fixed 2-week bounty drain spread ignored urgency | Urgency-weighted drain: `hours / clamp(days_remaining/7, 0.5, 4.0)` |
+| #10 | nodes.py | LRU cache could serve stale default start dates across midnight | Append `date.today()` to cache key |
+| #11 | nodes.py | TOCTOU race in cache hit/miss logging under concurrent load | Replace before/after `cache_info()` delta with a single post-call log |
+| #12 | nodes.py | LLM cache size was hardcoded; no tuning without code change | Read from `LLM_CACHE_SIZE` env var |
+| #13 | nodes.py | ERP data source was hardcoded to mock data | Abstract behind `_load_erp_data()`; `ERP_DATA_PATH` env var loads real JSON |
+| FIX 1–5 | server.py | Various O(n) inefficiencies; input length not guarded | Single-pass summary stats; input truncation at sentence boundary with warning |
+
+---
+
+## 15. Tech Stack & Dependencies
+
+| Component | Library | Version |
+|---|---|---|
+| Workflow engine | `langgraph` | ≥ 0.2.0 |
+| LLM orchestration | `langchain-core` | ≥ 0.3.0 |
+| LLM provider (optional) | `langchain-openai`, `openai` | ≥ 0.2.0 / ≥ 1.0.0 |
+| Data validation | `pydantic` | ≥ 2.0.0 |
+| Type hints | `typing-extensions` | ≥ 4.9.0 |
+| MCP server | `mcp` (FastMCP) | ≥ 1.0.0 |
+| Date utilities | `python-dateutil` | ≥ 2.8.0 |
+| Language | Python | ≥ 3.8 |
 
 ### Installation
+
 ```bash
 git clone <repository-url>
 cd <repository-directory>
 pip install -r requirements.txt
+```
+
+### Running the MCP Server
+
+```bash
+python server.py
+```
+
+The server starts in stdio transport mode (standard MCP convention). It prints logs to stderr and accepts JSON-RPC calls on stdin.
+
+### Optional: Enable LLM Extraction
+
+```bash
+export OPENAI_API_KEY=sk-...
+python server.py
+```
+
+### Optional: Load Real ERP Data
+
+```bash
+export ERP_DATA_PATH=/path/to/erp_export.json
+python server.py
+```
+
+### Visualise the Pipeline
+
+```bash
+python view_graph.py
+# Prints a Mermaid.js flowchart of the compiled LangGraph pipeline
+```
