@@ -104,6 +104,52 @@ class BountyStatus(str, Enum):
     OVERDUE     = "overdue"
 
 
+# ---------------------------------------------------------------------------
+# NEW v3: Bench + Health Enumerations
+# ---------------------------------------------------------------------------
+
+class BenchStatus(str, Enum):
+    """
+    Bench allocation state for an employee.
+
+    AVAILABLE_NOW       — Zero active assignment hours; fully on bench.
+    PARTIALLY_ALLOCATED — Has work but free capacity ≥ configurable threshold.
+    ROLLING_OFF_SOON    — All active assignments end within the rolling-off window.
+    FULLY_ALLOCATED     — Active, free capacity below threshold; not overloaded.
+    OVERALLOCATED       — Effective utilisation > 100%.
+    """
+    AVAILABLE_NOW       = "AVAILABLE_NOW"
+    PARTIALLY_ALLOCATED = "PARTIALLY_ALLOCATED"
+    ROLLING_OFF_SOON    = "ROLLING_OFF_SOON"
+    FULLY_ALLOCATED     = "FULLY_ALLOCATED"
+    OVERALLOCATED       = "OVERALLOCATED"
+
+
+class UtilizationBand(str, Enum):
+    """
+    Coarse utilisation band used by the workforce health engine.
+
+    UNDERUTILIZED    — util ≤ 25%
+    HEALTHY          — 25% < util ≤ 75%
+    HIGH_UTILIZATION — 75% < util ≤ 90%
+    OVERLOADED       — 90% < util ≤ 100%
+    CRITICAL         — util > 100%
+    """
+    UNDERUTILIZED    = "UNDERUTILIZED"
+    HEALTHY          = "HEALTHY"
+    HIGH_UTILIZATION = "HIGH_UTILIZATION"
+    OVERLOADED       = "OVERLOADED"
+    CRITICAL         = "CRITICAL"
+
+
+class BurnoutRisk(str, Enum):
+    """Categorical burnout risk derived from burnout_risk_score (0–100)."""
+    LOW      = "LOW"       # score ≤ 30
+    MODERATE = "MODERATE"  # score ≤ 60
+    HIGH     = "HIGH"      # score ≤ 80
+    CRITICAL = "CRITICAL"  # score > 80
+
+
 class Bounty(BaseModel):
     """
     A discrete task (bounty) assigned to an employee.
@@ -281,6 +327,54 @@ class DisqualifiedCandidate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# NEW v3: Bench Metrics (output of bench.py per-employee computation)
+# ---------------------------------------------------------------------------
+
+class BenchMetrics(BaseModel):
+    """
+    Bench availability status and related metrics for a single employee.
+
+    bench_percentage      : Fraction of weekly capacity that is unallocated (0–100).
+    bench_duration_days   : Calendar days until the employee becomes fully benched
+                            (0 if already benched).
+    projected_bench_date  : ISO-8601 date when the employee is expected to be
+                            fully bench-available.
+    last_project_end_date : ISO-8601 end date of the most recent active assignment
+                            (None if no active assignments).
+    primary_skill_cluster : Top skills by proficiency (used for bench skill mapping).
+    """
+    bench_status:          BenchStatus
+    bench_percentage:      float = Field(ge=0.0, le=100.0)
+    bench_duration_days:   int   = Field(ge=0)
+    projected_bench_date:  str
+    last_project_end_date: Optional[str] = None
+    primary_skill_cluster: List[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# NEW v3: Workforce Health Metrics (output of health.py per-employee computation)
+# ---------------------------------------------------------------------------
+
+class WorkforceHealthMetrics(BaseModel):
+    """
+    Workforce health snapshot for a single employee.
+
+    workload_score (0–100)       : Higher = lighter, healthier workload.
+    burnout_risk_score (0–100)   : Higher = greater burnout risk.
+    sustainability_score (0–100) : Composite of low burnout + healthy load.
+    utilization_band             : Coarse utilisation band (UNDERUTILIZED … CRITICAL).
+    burnout_risk                 : Categorical risk label.
+    health_warnings              : Human-readable warning strings surfaced in UI.
+    """
+    workload_score:       float = Field(ge=0.0, le=100.0)
+    burnout_risk_score:   float = Field(ge=0.0, le=100.0)
+    burnout_risk:         BurnoutRisk
+    sustainability_score: float = Field(ge=0.0, le=100.0)
+    utilization_band:     UtilizationBand
+    health_warnings:      List[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # 5. The Central Graph State
 # ---------------------------------------------------------------------------
 
@@ -291,7 +385,12 @@ class GraphState(TypedDict):
     raw_erp_data:            Optional[Dict[str, Any]]
     processed_metrics:       Optional[List[Dict[str, Any]]]
     ranked_candidates:       Optional[List[Dict[str, Any]]]
-    disqualified_candidates: Optional[List[Dict[str, Any]]]   # ← NEW
+    disqualified_candidates: Optional[List[Dict[str, Any]]]   # ← v2
     department_recommendations: Optional[List[Dict[str, Any]]]
+
+    # ── NEW v3: Bench + Health aggregate summaries ─────────────────────────
+    # Optional so existing callers that do not set them continue to work.
+    bench_summary:            Optional[Dict[str, Any]]
+    workforce_health_summary: Optional[Dict[str, Any]]
 
     errors: Optional[List[str]]

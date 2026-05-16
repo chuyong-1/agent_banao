@@ -71,6 +71,9 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
     disqualified = final_state.get("disqualified_candidates") or []
     dept_recs    = final_state.get("department_recommendations") or []
     errors       = final_state.get("errors")                  or []
+    # NEW v3: bench + health summaries (None when computed by old pipeline)
+    bench_summary            = final_state.get("bench_summary") or {}
+    workforce_health_summary = final_state.get("workforce_health_summary") or {}
 
     today_str = date.today().isoformat()
 
@@ -131,6 +134,19 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
             "skill_match":   "30%",
             "reliability":   "25%",
         },
+        # NEW v3: Org-level bench + health indicators (None when not computed)
+        "bench": {
+            "total_bench_capacity_h_wk": bench_summary.get("total_bench_capacity_hours_per_week"),
+            "available_now_count":        bench_summary.get("available_now_count"),
+            "rolling_off_soon_count":     bench_summary.get("rolling_off_soon_count"),
+            "overallocated_count":        bench_summary.get("overallocated_count"),
+        } if bench_summary else None,
+        "health": {
+            "average_utilization_pct":   workforce_health_summary.get("average_utilization_pct"),
+            "overloaded_employee_count": workforce_health_summary.get("overloaded_employee_count"),
+            "burnout_risk_count":        workforce_health_summary.get("burnout_risk_count"),
+            "underutilized_count":       workforce_health_summary.get("underutilized_employee_count"),
+        } if workforce_health_summary else None,
     }
 
     # ── Candidate cards ───────────────────────────────────────────────────
@@ -250,6 +266,9 @@ def _build_ui_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "disqualified":      disq_cards,
         "departments":       dept_recs,
         "pipeline_warnings": errors,
+        # NEW v3 — optional sections; absent when pipeline is old or bench/health disabled
+        "bench_summary":              bench_summary or None,
+        "workforce_health_summary":   workforce_health_summary or None,
     }
 
 

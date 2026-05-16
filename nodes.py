@@ -55,6 +55,17 @@ from state import (
 import json as _json
 from mock_data import MOCK_ERP_DATA
 
+# NEW v3: Bench + Health engines (strictly additive — no existing logic changed)
+try:
+    from bench import compute_bench_metrics, ENABLE_BENCH_BOOST, BENCH_AVAILABILITY_BOOST
+    from health import compute_workforce_health, health_aware_fit_score, HEALTH_AWARE_SCORING
+    _BENCH_HEALTH_AVAILABLE = True
+except ImportError:
+    _BENCH_HEALTH_AVAILABLE = False
+    HEALTH_AWARE_SCORING   = False
+    ENABLE_BENCH_BOOST     = False
+    BENCH_AVAILABILITY_BOOST = 0.0
+
 
 def _load_erp_data() -> Dict[str, Any]:
     """
@@ -833,7 +844,34 @@ def compute_metrics_node(state: GraphState) -> Dict[str, Any]:
             is_disqualified            = disqualified,
             disqualification_reason    = disq_reason,
         )
-        metrics.append(m.model_dump())
+        m_dict = m.model_dump()
+
+        # ── NEW v3: Bench + Health (additive — appended after model_dump) ──
+        if _BENCH_HEALTH_AVAILABLE:
+            try:
+                bench_m = compute_bench_metrics(
+                    employee                 = emp,
+                    active_assignments       = active_asgns.get(eid, []),
+                    available_hours_per_week = round(available_hours, 2),
+                    utilization_pct          = utilization_pct,
+                    today                    = today,
+                )
+                m_dict["bench_metrics"] = bench_m.model_dump()
+            except Exception as _bench_exc:
+                logger.warning("[Node 3] bench metrics failed for %s: %s", emp["name"], _bench_exc)
+                m_dict["bench_metrics"] = None
+
+            try:
+                health_m = compute_workforce_health(m_dict, today)
+                m_dict["workforce_health"] = health_m.model_dump()
+            except Exception as _health_exc:
+                logger.warning("[Node 3] health metrics failed for %s: %s", emp["name"], _health_exc)
+                m_dict["workforce_health"] = None
+        else:
+            m_dict["bench_metrics"]    = None
+            m_dict["workforce_health"] = None
+
+        metrics.append(m_dict)
         logger.debug(
             "[Node 3] %-20s util=%.0f%%  avail=%.0f  rely=%.0f  disq=%s",
             emp["name"], utilization_pct, availability_score,
@@ -981,12 +1019,30 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
 
         availability_score = m["availability_score"]
         reliability_score  = bm["reliability_score"]
-        fit_score = round(
-            W_AVAILABILITY * availability_score
-            + W_SKILL       * skill_score
-            + W_RELIABILITY * reliability_score,
-            1,
-        )
+
+        # NEW v3: Optional bench availability boost (default OFF — preserves existing ranking)
+        if _BENCH_HEALTH_AVAILABLE and ENABLE_BENCH_BOOST:
+            bench_m = m.get("bench_metrics") or {}
+            if bench_m.get("bench_status") == "AVAILABLE_NOW":
+                availability_score = min(100.0, availability_score + BENCH_AVAILABILITY_BOOST)
+
+        # NEW v3: Health-aware fit score (default OFF — preserves existing ranking exactly)
+        if _BENCH_HEALTH_AVAILABLE and HEALTH_AWARE_SCORING:
+            wh = m.get("workforce_health") or {}
+            sustainability = wh.get("sustainability_score", 70.0)
+            fit_score = health_aware_fit_score(
+                availability_score   = availability_score,
+                skill_score          = skill_score,
+                reliability_score    = reliability_score,
+                sustainability_score = sustainability,
+            )
+        else:
+            fit_score = round(
+                W_AVAILABILITY * availability_score
+                + W_SKILL       * skill_score
+                + W_RELIABILITY * reliability_score,
+                1,
+            )
 
         # ── Human-readable signals ─────────────────────────────────────────
         match_reasons: List[str] = []
@@ -1058,6 +1114,13 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
                 f"({ld['overlap_days']} days — merged unique days): "
                 f"{'; '.join(ld['leave_periods'])}"
             )
+
+        # NEW v3: Surface health warnings on the candidate card (additive only)
+        if _BENCH_HEALTH_AVAILABLE:
+            wh = m.get("workforce_health") or {}
+            for hw in wh.get("health_warnings", []):
+                if hw not in warnings:  # avoid duplicating overalloc warning
+                    warnings.append(hw)
 
         ranked.append(RankedCandidate(
             rank=0,
@@ -1185,8 +1248,24 @@ def matchmaker_node(state: GraphState) -> Dict[str, Any]:
         ranked[0].name if ranked else "N/A",
         ranked[0].fit_score if ranked else 0,
     )
+
+    # NEW v3: Compute org-level bench + health summaries (additive, never breaks old callers)
+    bench_summary:            Dict[str, Any] = {}
+    workforce_health_summary: Dict[str, Any] = {}
+    if _BENCH_HEALTH_AVAILABLE:
+        try:
+            from bench  import compute_bench_summary
+            from health import compute_health_summary
+            bench_summary            = compute_bench_summary(metrics)
+            workforce_health_summary = compute_health_summary(metrics)
+        except Exception as _summ_exc:
+            logger.warning("[Node 4] bench/health summary failed: %s", _summ_exc)
+
     return {
-        "ranked_candidates":       [c.model_dump() for c in ranked],
-        "disqualified_candidates": [d.model_dump() for d in disqualified],
+        "ranked_candidates":          [c.model_dump() for c in ranked],
+        "disqualified_candidates":    [d.model_dump() for d in disqualified],
         "department_recommendations": department_recommendations,
+        # NEW v3 keys — optional, backward-compatible
+        "bench_summary":              bench_summary or None,
+        "workforce_health_summary":   workforce_health_summary or None,
     }
